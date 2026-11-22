@@ -125,7 +125,7 @@
         body: {Default: {Disabled: false, MinimumRevisionsToKeep: 100}, Collections: {Users: {Disabled: false, MinimumRevisionsToKeep: 100}}}
 
     - name: Define the hub task (HubToSink, sink cluster 2 gets users/*)
-      ravendb_tasks:
+      rkc4_hub_sink:
         <<: *conn
         kind: define_hub
         hub_leader: 1a
@@ -156,7 +156,7 @@
              | combine({'MentorNode': 'A', 'PinToMentorNode': true}) }}
 
     - name: Attach the sink
-      ravendb_tasks:
+      rkc4_hub_sink:
         <<: *conn
         kind: attach_sinks
         db_name: "{{ repro_db }}"
