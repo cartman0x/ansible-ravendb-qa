@@ -1,0 +1,79 @@
+# scenarios/company-1/RKC3/vars.yml -- inputs for rkc3.yml (dataset 2: ~300M documents +
+# revisions).  Every key can be overridden with -e.
+#
+# Shape: many SMALL docs with a few revisions each -- the typical production database, and the
+# opposite of dataset 1 (few docs x millions of revisions).
+#   plain   50.9M docs x 4 revisions                                    = 50.9M docs + 203.6M revisions
+#   pruned     5M docs written 6x in a keep-3 collection                 =    5M docs +    15M revisions
+#                                                                            (+ 15M revision tombstones)
+#   att        5M docs x 4 revisions; 500k of them also get one small     =    5M docs +  20.5M revisions
+#              attachment (1 more revision each)
+#                                                                         = 60.9M docs + 239.1M revisions
+#                                                                         = 300.0M docs + revisions
+#
+# Why so few attachments: the key cleanup moves EVERY revision, so its scale is the 239M
+# revisions.  Attachments only make the rest slow -- seeding is one request each, and the
+# 6.2 -> 7.2 schema upgrade converts every attachment entry with the db offline.  500k keep both
+# paths covered (the 5M-attachment shape is in dataset-5m-attachments.yml).
+#
+# Seeding takes a few hours, ~160 GB on disk.  Build once, then restore:
+#   RKC3/run.sh 6.2.20 <deb> -e dataset_source=build      (see ../rkc-common/vars.yml)
+#
+# Quick trial at 1/30 scale (10M):  -e lg_scale=0.0333
+
+lg_node: "1a"
+lg_db: db_large
+
+# Multiplies every shape's doc count (1 = full size).  Use a small value for a trial run.
+lg_scale: 1
+
+lg_default_keep: 1000000
+lg_pruned_keep: 3
+lg_tombstone_cleanup_interval_min: 100000   # tombstone cleaner timer off (see ../RKC2/vars.yml)
+
+# docs are multiplied by lg_scale.  pad_bytes = size of a filler string in every revision body,
+# so a revision is ~150-200 bytes of JSON ("small documents").
+lg_shapes:
+  - { name: plain,  prefix: lg/plain,  collection: Plain,  docs: 50900000, revs: 4, pad_bytes: 120 }
+  - { name: pruned, prefix: lg/pruned, collection: Pruned, docs: 5000000,  revs: 6, pad_bytes: 120 }
+  - { name: att,    prefix: lg/att,    collection: Att,    docs: 5000000,  revs: 4, pad_bytes: 120,
+      att_docs: 500000, att_every: 4, att_size: 256 }
+
+# Every doc can't be fingerprinted at this size: totals are checked exactly, and this many docs
+# per shape (spread over the whole id range, plus the first and last) are checked in full.
+lg_sample_per_shape: 200
+
+# Loader tuning (attachments are one request each -- more threads help them most).
+lg_loader_threads: 16
+lg_loader_batch: 1000
+
+# Budgets at this size (override ../rkc-common/vars.yml).  The key cleanup on 239M revisions
+# takes ~9-10 h if the db fits in RAM, days if it does not.  So: stop early when the projected
+# total is over cleanup_max_hours (checked every 15 min from 30 min in -- see
+# ../rkc-common/vars.yml); the hard limit below only catches a cleanup that stops logging progress.
+cleanup_max_hours: 20
+cleanup_timeout_secs: 108000       # 30 h
+lg_orphan_check_budget_secs: 7200  # server-side orphan-revision scan
+lg_db_load_retries: 360            # x 5s: load of the db after restore / restart
+# First load after the upgrade runs the 6.2 -> 7.x schema upgrade (db offline, no progress
+# logged, so this is a plain time limit).  Expect ~1-2 h with 500k attachments; 6 h limit.
+lg_first_load_timeout_secs: 21600
+
+# Trigger the tombstone cleaner during the key cleanup (see ../RKC2/vars.yml).
+lg_cleaner_during: required
+
+# Data file + journal sizes (scripts/db_size.py): on 6.2, every lg_size_interval_secs through the
+# first load and the key cleanup, after the tombstone cleaner, the restart and the next write.
+# Saved to lg_size_json (remote.sh fetch copies /tmp/rkc-*.json and /tmp/rkc-*.csv).
+lg_size_interval_secs: 60
+lg_size_csv: "/tmp/rkc-sizes-{{ lg_db }}.csv"
+lg_size_json: "/tmp/rkc-sizes-{{ lg_db }}.json"
+
+# CPU, memory and disk I/O of the node's container (scripts/container_metrics.py), every
+# lg_metrics_interval_secs through the first load and the key cleanup.  Read from the host's
+# cgroup files (nothing runs in the container, the server is not asked anything), and the
+# counters are cumulative: the interval sets the resolution of the peaks, not the totals.
+# Summary per window -> lg_metrics_json; raw samples -> lg_metrics_csv (scripts/plot_metrics.py).
+lg_metrics_interval_secs: 10
+lg_metrics_csv: "/tmp/rkc-metrics-{{ lg_db }}.csv"
+lg_metrics_json: "/tmp/rkc-metrics-{{ lg_db }}.json"

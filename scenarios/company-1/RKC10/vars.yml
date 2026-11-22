@@ -1,0 +1,30 @@
+# scenarios/company-1/RKC10/vars.yml -- RKC10 = RKC5's playbook (../RKC5/rkc5.yml) on databases that
+# do NOT fit in memory.  run.sh passes this file with -e @, so every key here overrides RKC5's
+# vars.yml; anything else can still be changed with -e.
+#
+# Why: a database bigger than the server's RAM, on a cloud disk, is normal for customers.  The key cleanup touches
+# every revision once, so with the data mostly on disk each step waits for a disk read.
+# Every other test runs with the data in memory (kaiju: 187 GB RAM).
+#
+# Size: RKC5's shapes at scale 0.1 = per db 6.1M docs + 23.9M revisions, ~8 GB on disk; x 3 dbs
+# = ~24 GB, in a container capped at RKC10_MEMORY (run.sh, default 8g -- RavenDB itself uses ~2-3 GB
+# of it, leaving ~5 GB of cache for ~24 GB of data).
+rkc5_label: RKC10
+rkc5_scale: 0.1
+
+# A cloud disk (like AWS gp3 at its baseline): 1500 IOPS and 100 MB/s, applied right before the
+# upgrade, so the cleanups and user writes run on it (the 6.2 seed runs at full speed).  The kernel
+# limits reads and writes separately -- each may use the full amount; a cloud disk shares it.
+rkc5_io_iops: 1500
+rkc5_io_mbps: 100
+
+# Also time user writes to a db WHILE its own cleanup runs (not only to the bystander).
+rkc5_probe_cleaning_db: db_kc1
+
+# Unknown durations with the data on disk: generous budgets (the test reports how long it took).
+rkc5_load_timeout_secs: 7200
+rkc5_cleanup_timeout_secs: 43200      # 12 h for all cleanups
+rkc5_orphan_check_budget_secs: 7200
+rkc5_sample_interval_secs: 5
+
+rkc5_out_dir: /tmp/rkc10

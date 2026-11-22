@@ -1,0 +1,15 @@
+# scenarios/company-1/rkc-common/size_sample_start.yml -- task file.
+# Starts scripts/db_size.py sample in the background: every size_interval_secs, every db's data
+# file / journal sizes -> <size_csv>.  Stop it with size_sample_stop.yml.
+# Requires: size_node, size_dbs (list), size_csv, size_max_secs, repo_root.
+# Optional: size_interval_secs (default 15).  Sets: _size_job.
+
+- name: Start the data file + journal size sampler ({{ size_dbs | join(', ') }}, every {{ size_interval_secs | default(15) }}s)
+  ansible.builtin.command:
+    argv: [python3, "{{ repo_root }}/scripts/db_size.py", sample, --container, "{{ size_node }}",
+           --dbs, "{{ size_dbs | join(',') }}", --interval, "{{ size_interval_secs | default(15) | string }}",
+           --out, "{{ size_csv }}", --stop-file, "{{ size_csv }}.stop", --max-secs, "{{ size_max_secs | string }}"]
+  async: "{{ size_max_secs | int + 120 }}"
+  poll: 0
+  register: _size_job
+  changed_when: false

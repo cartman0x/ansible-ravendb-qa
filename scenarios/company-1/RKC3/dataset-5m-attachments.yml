@@ -1,0 +1,12 @@
+# scenarios/company-1/RKC3/dataset-5m-attachments.yml -- the ORIGINAL dataset 2 shape:
+# 60M docs + 240M revisions = 300M, 5M attachments.  Its 6.2.20 snapshot is in S3
+# (large_dataset/6.2.20/704a4b0d2dbd), so restore it instead of re-seeding:
+#   scenarios/company-1/RKC3/run.sh 6.2.20 <deb> -e @scenarios/company-1/RKC3/dataset-5m-attachments.yml -e dataset_source=restore
+# The 6.2 -> 7.2 schema upgrade converts 10M attachment entries with the db offline (~16 h on a
+# memory-starved laptop) -- hence the longer load limit.
+lg_shapes:
+  - { name: plain,  prefix: lg/plain,  collection: Plain,  docs: 50000000, revs: 4, pad_bytes: 120 }
+  - { name: pruned, prefix: lg/pruned, collection: Pruned, docs: 5000000,  revs: 6, pad_bytes: 120 }
+  - { name: att,    prefix: lg/att,    collection: Att,    docs: 5000000,  revs: 4, pad_bytes: 120,
+      att_docs: 5000000, att_every: 4, att_size: 256 }
+lg_first_load_timeout_secs: 64800   # 18 h

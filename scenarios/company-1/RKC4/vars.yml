@@ -1,0 +1,28 @@
+# scenarios/company-1/RKC4/vars.yml -- inputs for rkc4.yml (bug
+# reproduction).  Every key can be overridden with -e on the command line.
+
+# Hub = cluster 1 (1a, 1b on 6.2; 1c joins later on v_new).  Sink = cluster 2 leader 2a
+# (2b is created by the lab but not used).  Same database name on both sides.
+repro_db: repro
+repro_hub_task: repro-hub
+repro_new_hub_node: 1c          # added on v_new; the hub task moves to it -> it re-sends everything
+repro_new_hub_tag: C
+
+# One pair per check: a document written cluster-wide (gets a RAFT:..,TRXN:.. change vector on
+# 6.2 -- the form that a 7.2.5-7.2.7 hub re-spells) and a control written normally.
+repro_docs:
+  - { id: users/cw-write,        cluster_wide: true,  check: write }
+  - { id: users/regular-write,   cluster_wide: false, check: write }
+  - { id: users/cw-delete,       cluster_wide: true,  check: delete }
+  - { id: users/regular-delete,  cluster_wide: false, check: delete }
+  - { id: users/cw-enforce,      cluster_wide: true,  check: enforce }
+  - { id: users/regular-enforce, cluster_wide: false, check: enforce }
+repro_versions: 3                # versions per document written on 6.2 (the PR's test uses 3)
+
+# Users revisions on the sink: keep 100 while seeding, then this many for the checks.
+repro_keep_after: 2
+
+# What the run must show.  Default: a released version (7.2.7) -> bug; a .deb -> fixed.
+# repro_expect: bug | fixed
+
+repro_wait_secs: 180             # replication / database load waits

@@ -1,0 +1,41 @@
+# scenarios/company-1/RKC9/vars.yml -- inputs for rkc9.yml (the disk fills up in the middle of
+# the key cleanup).  Every key can be overridden with -e.
+
+df_node: "1a"
+df_db: db_full
+
+# The database lives on its own small filesystem: an ext4 image (sparse) loop-mounted INSIDE the
+# container at df_mount, and the database's DataDir points into it.  Nothing else (server logs,
+# the system database) is on it, so only this database runs out of space.
+df_mount: /var/lib/ravendb/rkc9-disk
+df_image: /root/rkc9-disk.img
+df_fs_size_gb: 8
+# After seeding, the dataset must leave room on it (else the 6.2 seed itself was squeezed).
+df_max_used_pct_after_seed: 70
+
+# When the disk is filled: once the cleanup has logged df_fill_after_lines progress lines, a
+# trigger inside the container fills the filesystem (fallocate) until df_reserve_mb is left.
+df_fill_after_lines: 5
+df_reserve_mb: 1
+# How long to wait for the database to hit the full disk (a "No space" / DiskFull / cleanup error
+# line).  If the cleanup finishes first, the test fails: it did not get to test anything.
+df_full_timeout_secs: 900
+# After the hit, how long the full disk is left as it is (the server must stay up).
+df_full_hold_secs: 60
+
+# Revisions policy (as RKC2 / RKC6).
+df_default_keep: 1000000
+df_pruned_keep: 3
+df_tombstone_cleanup_interval_min: 100000
+
+# The 6.2 dataset: enough revisions that the cleanup keeps writing (journals, data file growth)
+# for minutes -- 1M plain revisions plus attachments and ~200k revision tombstones.
+df_shapes:
+  - { name: att,    prefix: rkc9/att,    collection: Att,    docs: 20,   revs: 200,  att_docs: 10, att_every: 20,  att_size: 4096 }
+  - { name: plain,  prefix: rkc9/plain,  collection: Plain,  docs: 2000, revs: 500,  pad_bytes: 120 }
+  - { name: pruned, prefix: rkc9/pruned, collection: Pruned, docs: 40,   revs: 5000, att_docs: 5,  att_every: 500, att_size: 2048 }
+df_loader_threads: 8
+df_loader_batch: 1000
+
+cleanup_timeout_secs: 3600
+df_report_json: /tmp/rkc9-report.json

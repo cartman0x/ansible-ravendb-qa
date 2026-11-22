@@ -1,0 +1,63 @@
+# scenarios/company-1/RKC7/vars.yml -- inputs for rkc7.yml (dataset 1: a few documents with
+# millions of revisions each).  Every key can be overridden with -e.
+
+d1_node: "1a"
+d1_db: db_million
+
+# Which size to run:  laptop (default) | kaiju.  -e d1_profile=kaiju on the big machine.
+d1_profile: laptop
+
+# Shapes (scripts/revisions_loader.py).  Every doc is written by its own thread, one revision after
+# the other, so seeding runs one stream per doc -- a few docs means little parallelism.
+#   big      the dataset-1 docs: millions of revisions each.  The first att_docs of them get an
+#            attachment every att_every revisions; every later revision references it, so the
+#            cleanup's RevisionAttachments step has millions of rows for that one document.
+#   limited  seeded without a limit, then its collection is lowered to keep d1_limited_keep
+#            (still on 6.2) -- it goes into the upgrade far above its limit.
+# Ids sort big < limited < probe, the order the cleanup walks them: the limited doc is walked
+# LAST, so the test can write to it and run "enforce" while the cleanup has not reached it yet.
+d1_profiles:
+  laptop:
+    # 4 x 2.5M + 1M = 11M revisions, ~5 GB.  Seeding ~15 min, key cleanup ~30-60 min (estimates).
+    shapes:
+      - { name: big,     prefix: d1/big,     collection: Big,     docs: 4, revs: 2500000, pad_bytes: 120,
+          att_docs: 1, att_every: 1000000, att_size: 4096 }
+      - { name: limited, prefix: d1/limited, collection: Limited, docs: 1, revs: 1000000, pad_bytes: 120 }
+    cleanup_timeout_secs: 21600      # 6 h
+    enforce_timeout_secs: 3600
+  kaiju:
+    # 10 x 10M + 5M = 105M revisions, ~50 GB.  Adjust to the machine once it is known.
+    shapes:
+      - { name: big,     prefix: d1/big,     collection: Big,     docs: 10, revs: 10000000, pad_bytes: 120,
+          att_docs: 2, att_every: 2500000, att_size: 4096 }
+      - { name: limited, prefix: d1/limited, collection: Limited, docs: 1,  revs: 5000000,  pad_bytes: 120 }
+    cleanup_timeout_secs: 172800     # 48 h
+    enforce_timeout_secs: 14400
+
+d1_limited_keep: 1000
+
+# Writes to the limited doc WHILE the key cleanup runs (before it reaches the doc): they must not
+# prune it -- its count goes up by exactly this many, above its limit.
+d1_writes_during: 5
+
+# Revision sampling per doc (library/ravendb_revisions_sample.py): exact count + this many pages
+# of 1024 (newest, oldest, evenly spaced between).
+d1_sample_pages: 7
+
+# Measurements (report only, like ../RKC5):
+#   idle    -- right after the upgrade.  NOT idle: the server loads the db at startup, so it
+#              includes the schema upgrade and the cleanup's first seconds
+#   cleanup -- from the end of the idle window until "is done", with the write probe running
+#   after   -- d1_after_secs once the cleanup is done, write probe still running (its baseline)
+# The write probe writes to THIS db (collection Probe, revisions disabled): the key cleanup runs
+# its batches (up to 250 ms each) through this db's merger, which user writes wait on.
+d1_idle_secs: 60
+d1_after_secs: 120
+d1_sample_interval_secs: 2
+d1_size_interval_secs: 15    # data file + journal sizes (scripts/db_size.py)
+d1_probe_interval_secs: 0.2
+
+d1_load_timeout_secs: 3600     # wait for the db to come online (its load, started at server startup, includes the schema upgrade)
+d1_orphan_check_budget_secs: 7200
+d1_loader_batch: 1000
+d1_out_dir: /tmp/rkc7

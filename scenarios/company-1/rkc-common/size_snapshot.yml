@@ -1,0 +1,15 @@
+# scenarios/company-1/rkc-common/size_snapshot.yml -- task file.
+# One reading of every db's data file / journal sizes (scripts/db_size.py snapshot -- file metadata
+# only, never touches RavenDB), kept under a label in the fact `size_snapshots`.
+# Requires: size_node, size_dbs (list), size_label, repo_root.
+
+- name: Data file + journal sizes -- {{ size_label }}
+  ansible.builtin.command:
+    argv: [python3, "{{ repo_root }}/scripts/db_size.py", snapshot, --container, "{{ size_node }}",
+           --dbs, "{{ size_dbs | join(',') }}"]
+  register: _size_snap
+  changed_when: false
+
+- name: Keep it as "{{ size_label }}"
+  ansible.builtin.set_fact:
+    size_snapshots: "{{ size_snapshots | default({}) | combine({size_label: _size_snap.stdout | from_json}) }}"

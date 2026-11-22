@@ -1,0 +1,566 @@
+##################################################################################################
+# scenarios/company-1/RKC4/rkc4.yml -- reproduce the bug that the
+# revisions key cleanup PR (RavenDB-27675) fixes, and show that the PR build fixes it.
+#
+# THE BUG (from the PR, checked against the 7.2.7 code):
+#   6.2 stores a revision under its change vector text; 7.2.5+ stores and finds it by a hash of
+#   that change vector (node tags and entry order ignored).  A 7.2.5-7.2.7 HUB whose database was
+#   born on 6.2 re-spells every change vector it sends over pull replication (sorted, ", "-joined).
+#   A cluster-wide 6.2 revision ("RAFT:n-x,TRXN:i-y") therefore arrives at the sink in a second
+#   spelling ("RAFT:n-x, TRXN:i-y"): different text, same hash.  When the hub RE-SENDS what the
+#   sink already has, the sink stores that revision a second time -- a TWIN.  Deleting either
+#   twin deletes both (stock 7.2.7 deletes by hash and by text), so the next delete in the same
+#   pass reads a row that is gone: NullReferenceException in DeleteRevisionFromTable -- or, when
+#   it does not throw, a newer revision is deleted instead.
+#   One upgraded server on its own gets no twins: it takes the hub re-send.
+#
+# THE FLOW is the PR's own InterversionTests (SetupAffectedSinkAsync) on this lab.  The hub task
+# moves to a node added after the upgrade (1c): it has a new database id, so it re-sends everything.
+# Each check (write / delete / enforce) has its own cluster-wide document and its own control.
+#
+# RESULT: v_new = a released version (7.2.7) expects the bug -> "REPRODUCED" (passes when the
+# controls behave and the cluster-wide documents show twins + at least one failing operation).
+# v_new = a .deb (the PR build) expects everything clean -> "FIXED".  Override: -e repro_expect=.
+#
+# RUN (from the repo root -- builds a 2x2 lab, see run.sh):
+#   scenarios/company-1/RKC4/run.sh 6.2.20 7.2.7
+#   scenarios/company-1/RKC4/run.sh 6.2.20 builds/raven-pr23962.deb
+#
+# Docker mode only.
+##################################################################################################
+
+- ansible.builtin.import_playbook: ../../../toolbox/_internal/ensure_ravendb_venv.yml
+
+
+- name: Repro -- preflight
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Require the build to upgrade to
+      ansible.builtin.assert:
+        that:
+          - v_new_version is defined or custom_build is defined
+          - custom_build is not defined or 'download' in ansible_skip_tags
+          - target_mode | default('docker') == 'docker'
+          - (repro_expect | default('bug')) in ['bug', 'fixed']
+        fail_msg: >-
+          Run through RKC4/run.sh <v62> <v_new> (v_new = 7.2.7 or a .deb).  A .deb needs
+          --skip-tags download.  Docker mode only.  repro_expect must be bug or fixed.
+
+    - name: Plan
+      ansible.builtin.set_fact:
+        repo_root: "{{ playbook_dir }}/../../.."
+        repro_v_new: "{{ v_new_version | default(custom_build | basename) }}"
+        repro_expect_eff: "{{ repro_expect | default('bug' if v_new_version is defined else 'fixed') }}"
+        repro_hub_url: "https://1a.{{ ravendb_domain }}:443"
+        repro_hub_b_url: "https://1b.{{ ravendb_domain }}:443"
+        repro_sink_url: "https://2a.{{ ravendb_domain }}:443"
+        repro_new_url: "https://{{ repro_new_hub_node }}.{{ ravendb_domain }}:443"
+
+    - name: Read the version of 1a, 1b, 2a
+      ansible.builtin.uri:
+        url: "https://{{ item }}.{{ ravendb_domain }}:443/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      loop: [1a, 1b, 2a]
+      register: _v62
+
+    - name: Assert the lab is on 6.2
+      ansible.builtin.assert:
+        that: _v62.results | map(attribute='json.FullVersion') | select('match', '^6\.2\.') | list | length == 3
+        fail_msg: "expected 1a, 1b, 2a on 6.2, got {{ _v62.results | map(attribute='json.FullVersion') | list }}"
+
+    - name: Show plan
+      ansible.builtin.debug:
+        msg: >-
+          Plan -- reproduce the revisions bug: hub 1a+1b, sink 2a on {{ _v62.results[0].json.FullVersion }};
+          upgrade to {{ repro_v_new }}, new hub node {{ repro_new_hub_node }}; expect {{ repro_expect_eff | upper }}
+
+
+- name: Repro -- step 1 -- on 6.2, hub (1a + 1b) pulls to the sink (2a)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  vars:
+    _conn: &conn
+      ravendb_domain: "{{ ravendb_domain }}"
+      client_cert: "{{ cert_dir }}/client.pem"
+      ca_cert: "{{ cert_ca_crt }}"
+  tasks:
+    # Fixed placement: cluster 2 has 2 nodes (2a, 2b), and replication factor 1 alone lets
+    # RavenDB pick either -- on B, every call to 2a fails "repro is not relevant for A".
+    - name: Create {{ repro_db }} on the hub (nodes A + B) and on the sink (node A = 2a)
+      ravendb.ravendb.database:
+        url: "{{ item.url }}"
+        database_name: "{{ repro_db }}"
+        certificate_path: "{{ cert_dir }}/client.pem"
+        ca_cert_path: "{{ cert_ca_crt }}"
+        replication_factor: "{{ item.members | length }}"
+        topology_members: "{{ item.members }}"
+        state: present
+      loop:
+        - { url: "{{ repro_hub_url }}", members: [A, B] }
+        - { url: "{{ repro_sink_url }}", members: [A] }
+      loop_control: { label: "{{ item.url }} on {{ item.members | join('+') }}" }
+
+    - name: Revisions on the hub (Default keep 100)
+      ravendb_revisions:
+        <<: *conn
+        target: 1a
+        db_name: "{{ repro_db }}"
+        default_keep: 100
+        default_max_age_secs: 0
+
+    - name: Revisions on the sink (Users keep 100 -- lowered to {{ repro_keep_after }} in step 4)
+      ansible.builtin.uri:
+        url: "{{ repro_sink_url }}/databases/{{ repro_db }}/admin/revisions/config"
+        method: POST
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        status_code: [200, 201]
+        body_format: json
+        body: {Default: {Disabled: false, MinimumRevisionsToKeep: 100}, Collections: {Users: {Disabled: false, MinimumRevisionsToKeep: 100}}}
+
+    - name: Define the hub task (HubToSink, sink cluster 2 gets users/*)
+      rkc4_hub_sink:
+        <<: *conn
+        kind: define_hub
+        hub_leader: 1a
+        db_name: "{{ repro_db }}"
+        hub_task_name: "{{ repro_hub_task }}"
+        sink_cluster_ids: [2]
+        sink_allowed_paths: {"2": ["users/*"]}
+        replication_mode: HubToSink
+        replication_certs_dir: "{{ repo_root }}/replication-certs"
+
+    - name: Read the hub task
+      ansible.builtin.uri:
+        url: "{{ repro_hub_url }}/databases/{{ repro_db }}/tasks?type=PullReplicationAsHub"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _hub_task
+
+    - name: Pin the hub task to node A (as the PR's test does)
+      ansible.builtin.uri:
+        url: "{{ repro_hub_url }}/databases/{{ repro_db }}/admin/tasks/pull-replication/hub"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        status_code: [200, 201]
+        body_format: json
+        body: >-
+          {{ _hub_task.json.PullReplications | selectattr('Name', '==', repro_hub_task) | first
+             | combine({'MentorNode': 'A', 'PinToMentorNode': true}) }}
+
+    - name: Attach the sink
+      rkc4_hub_sink:
+        <<: *conn
+        kind: attach_sinks
+        db_name: "{{ repro_db }}"
+        hub_task_name: "{{ repro_hub_task }}"
+        hub_topology_urls: ["{{ repro_hub_url }}", "{{ repro_hub_b_url }}"]
+        sink_cluster_ids: [2]
+        sink_allowed_paths: {"2": ["users/*"]}
+        replication_mode: HubToSink
+        replication_certs_dir: "{{ repo_root }}/replication-certs"
+
+    - name: Write {{ repro_versions }} versions of every document on the hub
+      ansible.builtin.include_tasks: write_version.yml
+      loop: "{{ range(repro_versions | int) | product(repro_docs) | list }}"
+      loop_control: { label: "v{{ item.0 }} {{ item.1.id }}" }
+
+    - name: Wait for the last version of every document on the sink
+      ansible.builtin.uri:
+        url: "{{ repro_sink_url }}/databases/{{ repro_db }}/docs?id={{ item.id | urlencode }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        status_code: [200, 404]
+      loop: "{{ repro_docs }}"
+      loop_control: { label: "{{ item.id }}" }
+      register: _arrived
+      until: _arrived.status == 200 and _arrived.json.Results[0].Name == 'v' ~ (repro_versions | int - 1)
+      retries: "{{ (repro_wait_secs | int) // 3 }}"
+      delay: 3
+
+    - name: List revisions on the hub (6.2)
+      ansible.builtin.include_tasks: list_revisions.yml
+      vars: { repro_list_url: "{{ repro_hub_url }}", repro_list_as: listed_hub_62 }
+
+    - name: List revisions on the sink (6.2)
+      ansible.builtin.include_tasks: list_revisions.yml
+      vars: { repro_list_url: "{{ repro_sink_url }}", repro_list_as: listed_sink_62 }
+
+    - name: "Precondition: cluster-wide documents carry RAFT + TRXN, the sink has every revision once"
+      ansible.builtin.assert:
+        that:
+          - (item.cluster_wide | bool) == (listed_hub_62[item.id].cvs | select('search', 'RAFT:') | select('search', 'TRXN:') | list | length == repro_versions | int)
+          - listed_sink_62[item.id].count == repro_versions | int
+          - listed_sink_62[item.id].copies == 0
+        fail_msg: >-
+          {{ item.id }} ({{ 'cluster-wide' if item.cluster_wide else 'normal' }}):
+          hub {{ listed_hub_62[item.id].cvs }}, sink {{ listed_sink_62[item.id].cvs }}
+          -- expected {{ repro_versions }} revisions on the sink, RAFT+TRXN change vectors only on cluster-wide documents
+        quiet: true
+      loop: "{{ repro_docs }}"
+      loop_control: { label: "{{ item.id }}" }
+
+    - name: On 6.2
+      ansible.builtin.debug:
+        msg: "{{ repro_docs | map(attribute='id') | map('extract', listed_sink_62) | map(attribute='cvs') | list }}"
+
+
+- name: Repro -- step 2 -- stop the sink (it stays down until it is upgraded)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Stop RavenDB on 2a
+      ansible.builtin.command: docker exec 2a systemctl stop ravendb
+      changed_when: true
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  vars: { target: 1a }
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  vars: { target: 1b }
+
+- ansible.builtin.import_playbook: ../../../playbooks/add_node.yml
+  vars: { node_name: 1c, join_to: 1a }
+
+- name: Repro -- step 2 -- the database on the new node, the hub task moves to it
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Add {{ repro_db }} to node {{ repro_new_hub_tag }}
+      ansible.builtin.uri:
+        url: "{{ repro_hub_url }}/admin/databases/node?name={{ repro_db }}&node={{ repro_new_hub_tag }}"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        status_code: [200, 201]   # 7.2.7 answers 201 Created
+
+    - name: Wait for every document on {{ repro_new_hub_node }}
+      ansible.builtin.uri:
+        url: "{{ repro_new_url }}/databases/{{ repro_db }}/docs?id={{ item.id | urlencode }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        status_code: [200, 404, 503]
+      loop: "{{ repro_docs }}"
+      loop_control: { label: "{{ item.id }}" }
+      register: _on_c
+      until: _on_c.status == 200 and _on_c.json.Results[0].Name == 'v' ~ (repro_versions | int - 1)
+      retries: "{{ (repro_wait_secs | int) // 3 }}"
+      delay: 3
+
+    # A separate issue, not the PR's bug: a hub-access certificate registered
+    # on 6.2 is missing on a node that joins the cluster after the upgrade to 7.2.7 -- 1a/1b list
+    # it, 1c lists nothing at the same cluster index, so 1c refuses the sink (403, "certificate is
+    # unknown to the server") and nothing is re-sent.  Workaround: register the same access entry
+    # again (a cluster command, so 1c applies it too).  The assert below records whether it was missing.
+    - name: Read the hub access list on {{ repro_new_hub_node }}
+      ansible.builtin.uri:
+        url: "{{ repro_new_url }}/databases/{{ repro_db }}/admin/tasks/pull-replication/hub/access?name={{ repro_hub_task }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _access_on_new
+
+    - name: Report it
+      ansible.builtin.debug:
+        msg: >-
+          hub access entries on {{ repro_new_hub_node }} after it joined:
+          {{ _access_on_new.json.Results | length }}
+          {{- ' -- MISSING (the 6.2 entry did not reach the new node); re-registering it' if (_access_on_new.json.Results | length) == 0 else '' }}
+
+    - name: Read the sink's public certificate (from the PFX define_hub saved)
+      ansible.builtin.shell: >-
+        openssl pkcs12 -in {{ repo_root }}/replication-certs/cluster2.replication.pfx -nokeys -clcerts -passin pass:
+        | openssl x509 -outform DER | base64 -w0
+      register: _sink_pub
+      changed_when: false
+      no_log: true
+      when: (_access_on_new.json.Results | length) == 0
+
+    - name: Register the hub access entry again
+      ansible.builtin.uri:
+        url: "{{ repro_hub_url }}/databases/{{ repro_db }}/admin/tasks/pull-replication/hub/access?name={{ repro_hub_task }}"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        status_code: [200, 201]
+        body_format: json
+        body: {Name: access-cluster2, CertificateBase64: "{{ _sink_pub.stdout }}", AllowedHubToSinkPaths: ["users/*"], AllowedSinkToHubPaths: ["*"]}
+      when: (_access_on_new.json.Results | length) == 0
+
+    - name: Wait until {{ repro_new_hub_node }} lists it
+      ansible.builtin.uri:
+        url: "{{ repro_new_url }}/databases/{{ repro_db }}/admin/tasks/pull-replication/hub/access?name={{ repro_hub_task }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _access_again
+      until: _access_again.json.Results | length > 0
+      retries: 20
+      delay: 1
+
+    - name: Read the hub task
+      ansible.builtin.uri:
+        url: "{{ repro_hub_url }}/databases/{{ repro_db }}/tasks?type=PullReplicationAsHub"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _hub_task
+
+    - name: Move the hub task to node {{ repro_new_hub_tag }} (pinned) -- it will re-send everything
+      ansible.builtin.uri:
+        url: "{{ repro_hub_url }}/databases/{{ repro_db }}/admin/tasks/pull-replication/hub"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        status_code: [200, 201]
+        body_format: json
+        body: >-
+          {{ _hub_task.json.PullReplications | selectattr('Name', '==', repro_hub_task) | first
+             | combine({'MentorNode': repro_new_hub_tag, 'PinToMentorNode': true}) }}
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  vars: { target: 2a }
+
+
+- name: Repro -- step 3 -- the upgraded sink receives the re-send
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Make sure RavenDB runs on 2a
+      ansible.builtin.shell: docker exec 2a sh -c 'systemctl is-active --quiet ravendb || systemctl start ravendb'
+      changed_when: false
+
+    - name: Load {{ repro_db }} on the sink
+      ansible.builtin.uri:
+        url: "{{ repro_sink_url }}/databases/{{ repro_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        status_code: 200
+      register: _sink_up
+      until: _sink_up is succeeded
+      retries: "{{ (repro_wait_secs | int) // 3 }}"
+      delay: 3
+      when: repro_expect_eff == 'bug'
+
+    # On the PR build the key cleanup runs once the sink db loads (at server startup); old revisions of a document
+    # are only deleted after it has passed that document, so wait for it before the checks.
+    - name: Load {{ repro_db }} on the sink and wait for the key cleanup (PR build)
+      ansible.builtin.include_tasks: ../rkc-common/run_key_cleanup.yml
+      vars:
+        kc_node: 2a
+        kc_db: "{{ repro_db }}"
+        kc_cleaner_during: "off"
+        kc_load_timeout_secs: "{{ repro_wait_secs }}"
+      when: repro_expect_eff == 'fixed'
+
+    - name: Write a marker on {{ repro_new_hub_node }} -- replication sends in etag order, so it arrives after the re-send
+      ansible.builtin.uri:
+        url: "{{ repro_new_url }}/databases/{{ repro_db }}/docs?id=users/marker-after-move"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body: {Name: after-move, "@metadata": {"@collection": Users}}
+        status_code: [200, 201]
+
+    - name: Wait for the marker on the sink
+      ansible.builtin.uri:
+        url: "{{ repro_sink_url }}/databases/{{ repro_db }}/docs?id=users/marker-after-move"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        status_code: [200, 404, 503]
+      register: _marker
+      until: _marker.status == 200
+      retries: "{{ (repro_wait_secs | int) // 3 }}"
+      delay: 3
+
+    - name: List revisions on the sink after the re-send
+      ansible.builtin.include_tasks: list_revisions.yml
+      vars: { repro_list_url: "{{ repro_sink_url }}", repro_list_as: listed_resend }
+
+    - name: After the re-send
+      ansible.builtin.debug:
+        msg: >-
+          {{ repro_docs | map(attribute='id') | zip(repro_docs | map(attribute='id') | map('extract', listed_resend)
+             | map(attribute='cvs')) | list }}
+
+
+- name: Repro -- step 4 -- delete old revisions on the sink
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Lower the sink's Users revisions limit to {{ repro_keep_after }}
+      ansible.builtin.uri:
+        url: "{{ repro_sink_url }}/databases/{{ repro_db }}/admin/revisions/config"
+        method: POST
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        status_code: [200, 201]
+        body_format: json
+        body: {Default: {Disabled: false, MinimumRevisionsToKeep: 100}, Collections: {Users: {Disabled: false, MinimumRevisionsToKeep: "{{ repro_keep_after | int }}"}}}
+
+    - name: Wait until the sink applies it
+      ansible.builtin.uri:
+        url: "{{ repro_sink_url }}/databases/{{ repro_db }}/revisions/config"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _cfg
+      until: (_cfg.json.Collections.Users.MinimumRevisionsToKeep | default(-1) | int) == repro_keep_after | int
+      retries: 20
+      delay: 1
+
+    # -- write: each write deletes the document's revisions beyond the limit
+    - name: "Check write -- write each document once more on the sink"
+      ansible.builtin.uri:
+        url: "{{ repro_sink_url }}/databases/{{ repro_db }}/docs?id={{ item.id | urlencode }}"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body: {Name: v100, "@metadata": {"@collection": Users}}
+      loop: "{{ repro_docs | selectattr('check', '==', 'write') | list }}"
+      loop_control: { label: "{{ item.id }}" }
+      register: _w
+      failed_when: false
+
+    - name: "Check delete -- delete all revisions of each document"
+      ansible.builtin.uri:
+        url: "{{ repro_sink_url }}/databases/{{ repro_db }}/admin/revisions"
+        method: DELETE
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body: {DocumentIds: ["{{ item.id }}"], RemoveForceCreatedRevisions: false}
+      loop: "{{ repro_docs | selectattr('check', '==', 'delete') | list }}"
+      loop_control: { label: "{{ item.id }}" }
+      register: _d
+      failed_when: false
+
+    - name: List revisions after write + delete
+      ansible.builtin.include_tasks: list_revisions.yml
+      vars: { repro_list_url: "{{ repro_sink_url }}", repro_list_as: listed_after_ops }
+
+    # -- enforce: applies the limit to every document (the write/delete documents too -- their
+    #    results are already recorded above)
+    - name: "Check enforce -- enforce the revisions configuration"
+      ansible.builtin.uri:
+        url: "{{ repro_sink_url }}/databases/{{ repro_db }}/admin/revisions/config/enforce"
+        method: POST
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body: {IncludeForceCreated: false}
+      register: _e
+      failed_when: false
+
+    - name: Wait for the enforce operation
+      ansible.builtin.uri:
+        url: "{{ repro_sink_url }}/databases/{{ repro_db }}/operations/state?id={{ _e.json.OperationId }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _e_state
+      until: _e_state.json.Status | default('') in ['Completed', 'Faulted', 'Canceled']
+      retries: "{{ (repro_wait_secs | int) // 2 }}"
+      delay: 2
+      when: _e.json.OperationId is defined
+
+    - name: List revisions after enforce
+      ansible.builtin.include_tasks: list_revisions.yml
+      vars: { repro_list_url: "{{ repro_sink_url }}", repro_list_as: listed_after_enforce }
+
+    - name: Judge every check
+      ansible.builtin.set_fact:
+        repro_rows: >-
+          {%- set rows = [] -%}
+          {%- macro err(r) -%}
+          {%- if r.json is defined and r.json is mapping and r.json.Message is defined -%}
+          {{ r.json.Type | default('') | regex_replace('^.*\.', '') }}: {{ r.json.Message.split('\n')[0][:160] }}
+          {%- else -%}{{ r.msg | default('') }}{%- endif -%}
+          {%- endmacro -%}
+          {%- for d in repro_docs -%}
+          {%- set l = listed_resend[d.id] -%}
+          {%- set _ = rows.append({'check': 'twins', 'id': d.id, 'cw': d.cluster_wide, 'ok': l.copies == 0,
+                'detail': l.count ~ ' revisions listed after the re-send, ' ~ l.copies ~ ' of them a twin of another'}) -%}
+          {%- endfor -%}
+          {%- for r in _w.results -%}
+          {%- set l = listed_after_ops[r.item.id] -%}
+          {%- set ok = r.status in [200, 201] and l.count == repro_keep_after | int and l.copies == 0 -%}
+          {%- set _ = rows.append({'check': 'write', 'id': r.item.id, 'cw': r.item.cluster_wide, 'ok': ok,
+                'detail': 'PUT -> HTTP ' ~ r.status ~ ((' ' ~ err(r)) if r.status not in [200, 201] else '')
+                          ~ '; then ' ~ l.count ~ ' revisions (' ~ l.copies ~ ' twins), expected ' ~ repro_keep_after}) -%}
+          {%- endfor -%}
+          {%- for r in _d.results -%}
+          {%- set l = listed_after_ops[r.item.id] -%}
+          {%- set ok = r.status == 200 and l.count == 0 -%}
+          {%- set _ = rows.append({'check': 'delete', 'id': r.item.id, 'cw': r.item.cluster_wide, 'ok': ok,
+                'detail': 'DELETE revisions -> HTTP ' ~ r.status ~ ((' ' ~ err(r)) if r.status != 200 else '')
+                          ~ '; then ' ~ l.count ~ ' revisions, expected 0'}) -%}
+          {%- endfor -%}
+          {%- set st = _e_state.json | default({}) -%}
+          {%- set op = st.Status | default('not started: HTTP ' ~ _e.status ~ ' ' ~ err(_e)) -%}
+          {%- set op_err = ((st.Result | default({})).Error | default('') | string).split('\n')[0][:160] if op != 'Completed' else '' -%}
+          {%- for d in repro_docs | selectattr('check', '==', 'enforce') -%}
+          {%- set l = listed_after_enforce[d.id] -%}
+          {%- set ok = op == 'Completed' and l.count == repro_keep_after | int and l.copies == 0 -%}
+          {%- set _ = rows.append({'check': 'enforce', 'id': d.id, 'cw': d.cluster_wide, 'ok': ok,
+                'detail': 'enforce (one operation for both documents) -> ' ~ op ~ ((' ' ~ op_err) if op_err else '')
+                          ~ '; then ' ~ l.count ~ ' revisions (' ~ l.copies ~ ' twins), expected ' ~ repro_keep_after}) -%}
+          {%- endfor -%}
+          {{ rows }}
+
+    - name: Verdict
+      ansible.builtin.set_fact:
+        # enforce is ONE operation over the whole database: when the cluster-wide document makes it
+        # fault, its control fails with it -- so the enforce control is not part of the controls check
+        repro_controls_ok: "{{ repro_rows | rejectattr('cw') | rejectattr('check', '==', 'enforce') | rejectattr('ok') | list | length == 0 }}"
+        repro_twins: "{{ repro_rows | selectattr('cw') | selectattr('check', '==', 'twins') | rejectattr('ok') | list | length }}"
+        repro_failed_ops: "{{ repro_rows | selectattr('cw') | rejectattr('check', '==', 'twins') | rejectattr('ok') | list | length }}"
+
+    - name: Pass or fail
+      ansible.builtin.set_fact:
+        repro_pass: >-
+          {{ (repro_controls_ok | bool and (repro_twins | int) > 0 and (repro_failed_ops | int) > 0)
+             if repro_expect_eff == 'bug' else
+             (repro_rows | rejectattr('ok') | list | length == 0) }}
+
+    - name: Keep the result for the report (/tmp/rkc-repro-<v_new>.json)
+      ansible.builtin.copy:
+        dest: "/tmp/rkc-repro-{{ repro_v_new }}.json"
+        content: "{{ {'v_new': repro_v_new, 'expect': repro_expect_eff, 'rows': repro_rows,
+                      'listed_on_62': listed_sink_62, 'listed_after_resend': listed_resend} | to_nice_json }}"
+        mode: '0644'
+
+    - name: Results per check (BUG = the bug shows, OK = correct behaviour)
+      ansible.builtin.debug:
+        msg: >-
+          {%- set out = [] -%}
+          {%- for r in repro_rows -%}
+          {%- set _ = out.append(('OK ' if r.ok else 'BUG') ~ '  ' ~ '%-7s' | format(r.check) ~ '  ' ~ '%-22s' | format(r.id) ~ '  ' ~ r.detail) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "RESULT -- {{ 'REPRODUCED' if repro_expect_eff == 'bug' else 'FIXED' }} expected on {{ repro_v_new }}"
+      ansible.builtin.assert:
+        that: repro_pass | bool
+        success_msg: >-
+          {{ ('REPRODUCED on ' ~ repro_v_new ~ ': ' ~ repro_twins ~ ' cluster-wide document(s) got twin revisions from the hub re-send, '
+              ~ repro_failed_ops ~ ' revision-deleting operation(s) failed on them; the controls behaved')
+             if repro_expect_eff == 'bug' else
+             ('FIXED on ' ~ repro_v_new ~ ': no twins after the hub re-send, every operation deleted the right revisions') }}
+        fail_msg: >-
+          {{ ('NOT REPRODUCED on ' ~ repro_v_new ~ ': twins=' ~ repro_twins ~ ', failing operations=' ~ repro_failed_ops
+              ~ ', controls ok=' ~ repro_controls_ok ~ ' -- see "Results per check" above')
+             if repro_expect_eff == 'bug' else
+             ('NOT FIXED on ' ~ repro_v_new ~ ': ' ~ (repro_rows | rejectattr('ok') | map(attribute='check') | zip(repro_rows | rejectattr('ok') | map(attribute='id')) | map('join', ' ') | list | join(', '))
+              ~ ' -- see "Results per check" above') }}

@@ -1,0 +1,22 @@
+# scenarios/company-1/rkc-common/dataset_points.yml -- task file.
+# Lists the snapshot backups in this dataset's S3 folder and sets `dataset_snapshots`
+# (newest first).  Requires: dataset_node, dataset_s3_folder, plus rkc-common/vars.yml.
+
+- name: List snapshots in s3://{{ dataset_s3_bucket }}/{{ dataset_s3_folder }}
+  ravendb_backup:
+    kind: restore_points
+    ravendb_domain: "{{ ravendb_domain }}"
+    client_cert: "{{ cert_dir }}/client.pem"
+    ca_cert: "{{ cert_ca_crt }}"
+    target: "{{ dataset_node }}"
+    s3_bucket: "{{ dataset_s3_bucket }}"
+    s3_region: "{{ dataset_s3_region }}"
+    s3_folder: "{{ dataset_s3_folder }}"
+    s3_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+    s3_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+    s3_session_token: "{{ lookup('env', 'AWS_SESSION_TOKEN') | default(omit, true) }}"
+  register: _points
+
+- name: Keep the snapshots
+  ansible.builtin.set_fact:
+    dataset_snapshots: "{{ _points.restore_points | selectattr('is_snapshot') | list }}"

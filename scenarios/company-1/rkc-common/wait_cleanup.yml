@@ -1,0 +1,131 @@
+# scenarios/company-1/rkc-common/wait_cleanup.yml -- task file.
+# Waits until the node's logs hold at least `cleanup_expected_done` "is done" lines (one per
+# database), then fails on any cleanup line that mentions an error.
+# Requires: cleanup_node, plus rkc-common/vars.yml.  Optional: cleanup_expected_done (default 1).
+# Sets: cleanup_lines (stdout_lines = every non-progress cleanup line + the first and the last 5
+#       progress lines -- a big db logs millions), cleanup_line_total (all cleanup lines).
+#
+# EARLY STOP (optional) -- with cleanup_db and cleanup_universe (the dataset's shapes:
+# [{prefix, docs}, ...]) set, scripts/cleanup_eta.py reads the progress lines every
+# cleanup_eta_every_min, works out how far the cleanup is and when it will end, and writes that
+# to /tmp/rkc-cleanup-eta-<db>.log.  If cleanup_max_hours > 0 and the projected total is over
+# it, the wait stops with the numbers instead of running for days.
+#
+# The wait is ONE quiet task (no "FAILED - RETRYING" line every 5s): it only returns when the key
+# cleanup is done, the ETA is over budget, the cleaner logged an ERROR, or cleanup_timeout_secs
+# (wall clock) ran out.
+#
+# The cleaner's error line says "An error occurred in the revisions key cleanup ..." -- lower-case
+# "revisions" -- and the cleaner STOPS after it (it continues only on the next db load), so "is
+# done" would never come.  The wait therefore stops on that line at once and shows it, instead of
+# running into the timeout (30 h in RKC3); lines are collected case-insensitively for the same reason.
+
+- name: Set the early-stop inputs
+  ansible.builtin.set_fact:
+    _eta_on: "{{ cleanup_db is defined and (cleanup_universe | default([]) | length) > 0 }}"
+    _eta_log: "/tmp/rkc-cleanup-eta-{{ cleanup_db | default('none') }}.log"
+
+- name: How to follow the key cleanup live
+  ansible.builtin.debug:
+    msg: >-
+      Waiting up to {{ ((cleanup_timeout_secs | int) / 3600) | round(1) }} h
+      {%- if _eta_on and (cleanup_max_hours | float) > 0 %}, stopping early if the cleanup is
+      projected to take over {{ cleanup_max_hours }} h (first check after {{ cleanup_eta_first_check_min }} min)
+      {%- endif %}.  Live progress in another terminal:
+      docker exec {{ cleanup_node }} sh -c 'tail -F {{ log_dir }}/* | grep --line-buffered "{{ cleanup_any_pattern }}"'
+      {%- if _eta_on %}   Progress + ETA every {{ cleanup_eta_every_min }} min: tail -f {{ _eta_log }}{% endif %}
+
+- name: Wait for the cleanup to finish
+  block:
+    - name: >-
+        Wait for {{ cleanup_expected_done | default(1) }} "{{ cleanup_done_pattern }}" line(s) on {{ cleanup_node }}
+        {%- if _eta_on and (cleanup_max_hours | float) > 0 %} (early stop over {{ cleanup_max_hours }} h){% endif %}
+      ansible.builtin.shell: |
+        N={{ cleanup_node }}; want={{ cleanup_expected_done | default(1) | int }}
+        start=$(date +%s); end=$((start + {{ cleanup_timeout_secs | int }})); c=0
+        next_eta=$((start + 60))
+        {% if _eta_on %}: > {{ _eta_log }}{% endif %}
+
+        while [ $(date +%s) -lt $end ]; do
+          out=$(docker exec $N sh -c "grep -rhiE -- '{{ cleanup_done_pattern }}|{{ cleanup_error_pattern }}' {{ log_dir }} 2>/dev/null") || out=""
+          e=$(printf '%s\n' "$out" | grep -iF -- '{{ cleanup_error_pattern }}' | head -3)
+          if [ -n "$e" ]; then
+            echo "CLEANUP_ERROR after ~$(( $(date +%s) - start ))s of waiting -- the cleaner stopped:"
+            printf '%s\n' "$e" | tr '\036' '~' | cut -c1-1500
+            exit 4
+          fi
+          c=$(printf '%s\n' "$out" | grep -ciF -- '{{ cleanup_done_pattern }}')
+          if [ "$c" -ge "$want" ]; then echo "done after ~$(( $(date +%s) - start ))s of waiting"; exit 0; fi
+        {% if _eta_on %}
+          if [ $(date +%s) -ge $next_eta ]; then
+            next_eta=$(( $(date +%s) + {{ (cleanup_eta_every_min | float * 60) | int }} ))
+            r=$(docker exec $N sh -c "grep -rhF -- '{{ cleanup_progress_pattern }}' {{ log_dir }} 2>/dev/null" \
+                | grep -F '|{{ cleanup_db }}|' \
+                | {{ ansible_playbook_python }} {{ playbook_dir }}/../../../scripts/cleanup_eta.py \
+                    --universe {{ cleanup_universe | map('dict2items') | map('selectattr', 'key', 'in', ['prefix', 'docs']) | map('items2dict') | list | to_json | quote }} \
+                    --max-hours {{ cleanup_max_hours | float }} --window-min {{ cleanup_eta_window_min }} \
+                    --min-observe-min {{ cleanup_eta_first_check_min }})
+            rc=$?
+            echo "$(date '+%Y-%m-%d %H:%M') $r" >> {{ _eta_log }}
+            if [ $rc -eq 3 ]; then echo "TOO_SLOW_AFTER_SECS=$(( $(date +%s) - start ))"; echo "$r"; exit 3; fi
+          fi
+        {% endif %}
+          sleep 5
+        done
+        echo "timed out after {{ cleanup_timeout_secs | int }}s ($c of $want done lines)"
+        {% if _eta_on %}tail -1 {{ _eta_log }}{% endif %}
+
+        exit 1
+      args:
+        executable: /bin/bash
+      register: _done
+      changed_when: false
+      failed_when: false
+  always:
+    - name: Collect cleanup log lines (all but the middle of the progress lines)
+      ansible.builtin.shell: >-
+        docker exec {{ cleanup_node }} sh -c
+        "grep -rhiF -- '{{ cleanup_any_pattern }}' {{ log_dir }} 2>/dev/null | tr '\036' '~' > /tmp/rkc-lines;
+        { grep -vF -- '{{ cleanup_progress_pattern }}' /tmp/rkc-lines;
+          grep -F -- '{{ cleanup_progress_pattern }}' /tmp/rkc-lines | sort | sed -n '1p';
+          grep -F -- '{{ cleanup_progress_pattern }}' /tmp/rkc-lines | sort | tail -5; } | sort -u;
+        echo TOTAL=\$(wc -l < /tmp/rkc-lines); rm -f /tmp/rkc-lines"
+      register: _collected
+      changed_when: false
+      failed_when: false
+
+    - name: Keep the cleanup lines
+      ansible.builtin.set_fact:
+        cleanup_lines: "{{ {'stdout_lines': _collected.stdout_lines | default([]) | reject('match', '^TOTAL=') | list} }}"
+        cleanup_line_total: "{{ (_collected.stdout_lines | default(['TOTAL=0']) | select('match', '^TOTAL=') | first | default('TOTAL=0')).split('=') | last | int }}"
+
+    - name: Show cleanup log lines
+      ansible.builtin.debug:
+        msg: >-
+          {{ _done.stdout_lines | default([]) | reject('match', '^TOO_SLOW_AFTER_SECS=') | join(' ') }} --
+          {{ cleanup_line_total }} cleanup line(s), last 5:
+          {{ cleanup_lines.stdout_lines[-5:] }}
+
+- name: Stop -- the key cleanup would take too long
+  ansible.builtin.fail:
+    msg: >-
+      EARLY STOP after {{ ((_done.stdout_lines | select('match', '^TOO_SLOW_AFTER_SECS=') | first).split('=') | last | int / 60) | round | int }}
+      min of waiting: {{ _done.stdout_lines | reject('match', '^TOO_SLOW_AFTER_SECS=') | join(' ') }}.
+      The cleanup keeps running in the server; history: {{ _eta_log }}.
+      Raise the budget with -e cleanup_max_hours=N, or -e cleanup_max_hours=0 to only report.
+  when: _done.rc == 3
+
+- name: Stop -- the key cleanup logged an error and stopped
+  ansible.builtin.fail:
+    msg: "{{ _done.stdout_lines | join(' ') }}"
+  when: _done.rc == 4
+
+- name: Stop -- the key cleanup did not finish in time
+  ansible.builtin.fail:
+    msg: "{{ _done.stdout_lines | join(' ') }} (cleanup_timeout_secs={{ cleanup_timeout_secs }})"
+  when: _done.rc != 0
+
+- name: Assert no cleanup error line
+  ansible.builtin.assert:
+    that: cleanup_lines.stdout_lines | select('search', '(?i)error|exception|fail') | list | length == 0
+    fail_msg: "cleanup error line(s): {{ cleanup_lines.stdout_lines | select('search', '(?i)error|exception|fail') | list }}"

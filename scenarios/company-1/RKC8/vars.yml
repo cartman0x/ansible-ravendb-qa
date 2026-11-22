@@ -1,0 +1,48 @@
+# scenarios/company-1/RKC8/vars.yml -- inputs for rkc8.yml (rolling upgrade of a 3-node cluster
+# while users keep writing).  Every key can be overridden with -e.
+
+# The cluster (run.sh builds a 1x3 lab: 1a, 1b, 1c) and the order of the rolling upgrade.
+# The upgrade plays in rkc8.yml name 1a / 1b / 1c directly (Ansible picks a play's hosts before
+# it reads vars files), so changing this list needs those three plays changed too.
+rl_nodes: ["1a", "1b", "1c"]
+rl_db: db_rolling
+
+# Revisions: Default keeps everything; Pruned keeps 3 (its pruning on 6.2 leaves revision tombstones).
+rl_default_keep: 1000000
+rl_pruned_keep: 3
+# Tombstone cleaner's timer off (minutes): its own tests are RKC2 / RKC3; here it would only blur
+# the tombstone counts.
+rl_tombstone_cleanup_interval_min: 100000
+
+# The 6.2 dataset (scripts/revisions_loader.py, written on 1a, replicated to 1b and 1c).
+# Sized so ONE node's key cleanup lasts longer than upgrading the other two (~2-3 min each):
+# 200k plain docs x 20 revisions = 4M revisions, ~10-20 min of cleanup per node.  It is not the
+# 300M dataset on purpose: what matters here is that cleanups, upgrades, replication and user
+# writes overlap, and three replicated copies of 300M would take most of a day to build.
+# Bigger: -e '{"rl_shapes": [...]}' -- the test fails with a hint if the overlap did not happen.
+rl_shapes:
+  - { name: att,    prefix: rkc8/att,    collection: Att,    docs: 200,    revs: 100, att_docs: 100, att_every: 20, att_size: 2048 }
+  - { name: plain,  prefix: rkc8/plain,  collection: Plain,  docs: 200000, revs: 20,  pad_bytes: 120 }
+  - { name: pruned, prefix: rkc8/pruned, collection: Pruned, docs: 500,    revs: 400, att_docs: 50, att_every: 100, att_size: 1024 }
+rl_loader_threads: 8
+rl_loader_batch: 1000
+
+# The live writer (scripts/live_writer.py): every rl_live_every-th PLAIN doc gets user writes, on
+# its home node (the docs take turns over the 3 nodes), from before the first upgrade until
+# rl_writes_after_secs after the last node's key cleanup is done.  Plain ids are spread over the
+# whole range, so the cleanup meets written docs both ahead of and behind its position.
+rl_live_shape: plain
+rl_live_every: 100              # 200000 / 100 = 2000 written docs
+rl_writer_threads: 6
+rl_writer_interval_secs: 0.05   # per thread: up to ~120 writes/s in all
+rl_writes_before_secs: 60       # all nodes still on 6.2
+rl_writes_after_secs: 60        # all nodes upgraded and done
+
+# Docs that are NOT written are checked on a sample: this many plain docs (spread over the range),
+# plus every att and pruned doc.  Written docs are all checked.
+rl_sample_plain: 300
+
+cleanup_timeout_secs: 7200          # per node, after its upgrade
+rl_progress_timeout_secs: 900       # upgraded node: db loaded and first progress line
+rl_parity_timeout_secs: 1800        # replication catches up (seed; after the writes stop)
+rl_report_json: /tmp/rkc8-report.json

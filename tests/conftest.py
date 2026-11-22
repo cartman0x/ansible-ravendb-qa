@@ -37,6 +37,7 @@ def _install_ansible_shim():
 
     mod = _install("ravendb_client")
     _install("polling")
+    _install("revision_data")
 
     if "ansible.module_utils.basic" not in sys.modules:
         basic = types.ModuleType("ansible.module_utils.basic")

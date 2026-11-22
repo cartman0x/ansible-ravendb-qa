@@ -1,0 +1,47 @@
+# scenarios/company-1/RKC2/vars.yml -- inputs for
+# rkc2.yml (dataset 3).  Every key can be overridden with -e on the command line.
+
+at_node: "1a"
+at_db: db_att
+
+# Revisions policy written on 6.2 before seeding.
+#   Default: keep at_default_keep -- set above any shape's revision count, so nothing in
+#            the Att collection is ever pruned.
+#   Pruned:  keep at_pruned_keep -- every write past `keep` prunes the oldest revision and
+#            leaves a revision tombstone.
+#   Excess:  seeded under Default (unlimited), THEN lowered to keep at_excess_keep, still on
+#            6.2.  Lowering `keep` prunes nothing until the doc's next write, so these docs
+#            go into the upgrade holding more revisions than their config allows.
+at_default_keep: 1000000
+at_pruned_keep: 3
+at_excess_keep: 3
+
+# The tombstone cleaner (RavenDB's periodic tombstone purge -- NOT the key cleanup) would
+# purge these tombstones within minutes on 6.2, which has no protection.  This per-database
+# setting (minutes) switches its timer off; the scenario triggers it by hand after the key
+# cleanup instead (POST /databases/<db>/admin/tombstones/cleanup).
+at_tombstone_cleanup_interval_min: 100000
+
+# Data shapes, each written by scripts/revisions_loader.py.
+# Ids are <prefix>/0 .. <prefix>/<docs-1>.  Docs < att_docs get a distinct attachment
+# (att_size bytes) every att_every revisions; each attachment adds one revision.
+#   att    -- unlimited revisions, half the docs carry attachments on many revisions.
+#   pruned -- keep-3 collection: ~ docs x (revs - 3) revision tombstones; some pruned
+#             revisions carried attachments, so attachment references are dropped too.
+#   excess -- 50 revisions each, over their (lowered) keep-3 config until the next write.
+# Collections are fixed by role: Pruned and Excess get the keeps above, anything else Default.
+at_shapes:
+  - { name: att,    prefix: rkc/att,    collection: Att,    docs: 20, revs: 200,  att_docs: 10, att_every: 20,  att_size: 4096 }
+  - { name: pruned, prefix: rkc/pruned, collection: Pruned, docs: 20, revs: 5000, att_docs: 5,  att_every: 500, att_size: 2048 }
+  - { name: excess, prefix: rkc/excess, collection: Excess, docs: 10, revs: 50 }
+
+# Trigger the tombstone cleaner DURING the key cleanup (as soon as its first progress line
+# appears) and assert it deletes nothing.  The window is a few seconds with the default shapes.
+#   required -- fail if the key cleanup finished before the trigger could fire
+#   optional -- report a missed window, don't fail
+#   off      -- skip the check
+at_cleaner_during: required
+
+# Loader tuning.
+at_loader_threads: 8
+at_loader_batch: 1000

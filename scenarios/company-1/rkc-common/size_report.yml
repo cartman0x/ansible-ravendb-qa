@@ -1,0 +1,34 @@
+# scenarios/company-1/rkc-common/size_report.yml -- task file.
+# Prints data file / journal sizes per db, in MB: every snapshot in `size_snapshots` (in the order
+# taken) and, if set, every window in `size_windows` (first -> last, peak).  Reported, not judged.
+# data = Raven.voron nominal (allocated in brackets when it differs -- a sparse file);
+# journals = Journals folder (files in use + recyclable); total = the db folder, allocated.
+
+- name: Data file and journal sizes (MB, reported -- not judged)
+  ansible.builtin.debug:
+    msg: >-
+      {%- set mb = 1048576 -%}
+      {%- set out = [] -%}
+      {%- set dbs = [] -%}
+      {%- for s in (size_snapshots | default({})).values() -%}{%- for db in s if db not in dbs -%}{%- set _ = dbs.append(db) -%}{%- endfor -%}{%- endfor -%}
+      {%- for db in dbs -%}
+      {%- set _ = out.append(db ~ ':') -%}
+      {%- for label, s in (size_snapshots | default({})).items() -%}
+      {%- set v = s[db] | default(none) -%}
+      {%- if v -%}
+      {%- set _ = out.append('  ' ~ label ~ ': data ' ~ (v.voron_bytes // mb)
+            ~ ((' (alloc ' ~ (v.voron_alloc_bytes // mb) ~ ')') if (v.voron_alloc_bytes // mb) != (v.voron_bytes // mb) else '')
+            ~ ', journals ' ~ (v.journal_bytes // mb) ~ ' (' ~ v.journal_files ~ ' + ' ~ v.recyclable_files ~ ' recyclable)'
+            ~ ', temp ' ~ (v.temp_bytes // mb) ~ ', total ' ~ (v.total_alloc_bytes // mb)) -%}
+      {%- else -%}
+      {%- set _ = out.append('  ' ~ label ~ ': (no db folder)') -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- for win, w in (size_windows | default({})).items() if db in w -%}
+      {%- set v = w[db] -%}
+      {%- set _ = out.append('  during ' ~ win ~ ' (' ~ v.samples ~ ' readings): data ' ~ (v.voron_bytes.first // mb) ~ ' -> '
+            ~ (v.voron_bytes.last // mb) ~ ', journals peak ' ~ (v.journal_bytes.peak // mb) ~ ' (' ~ v.journal_files.peak
+            ~ ' files), temp peak ' ~ (v.temp_bytes.peak // mb) ~ ', total peak ' ~ (v.total_alloc_bytes.peak // mb)) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}

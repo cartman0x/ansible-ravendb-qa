@@ -1,0 +1,1001 @@
+##################################################################################################
+# scenarios/company-1/RKC3/rkc3.yml -- dataset 2: ~300M documents + revisions (60M small docs,
+# 240M revisions, 15M revision tombstones, 500k attachments), 6.2 -> v_new, ONE node.
+#
+# Same flow as ../RKC2/rkc2.yml, at scale.  Every doc can't be checked at this size, so:
+#   * TOTALS are exact: docs, revisions, unique attachments, and a revision-tombstone floor
+#   * a SAMPLE of docs per shape (spread over the id range + first/last) is fingerprinted and
+#     has its attachments read back, before and after
+#
+# RUN (the default seeds the dataset on this machine; no S3, no AWS keys):
+#   scenarios/company-1/RKC3/run.sh 6.2.20 <deb>
+#
+# LOCAL snapshot on this machine (-e dataset_source=local; run_all.sh --kaiju uses it): restore the
+# dataset from dataset_local_root if a snapshot of this exact shape is there; else seed it, verify
+# it, save a snapshot there, and go on with the test.  Moving it in and out of the lab's backups
+# volume is a rename / hard links (same disk), so it costs no copying.  Needs sudo (the volume is
+# root's).  No AWS.
+#
+# OPTIONAL S3 snapshot (skips the seed next time).  Only -e dataset_source=build|restore uses S3,
+# and only then are the AWS_* / RAVENDB_QA_S3_BUCKET environment variables needed (see
+# ../rkc-common/vars.yml):
+#   scenarios/company-1/RKC3/run.sh 6.2.20 <deb> -e dataset_source=build     # seed + upload
+#   scenarios/company-1/RKC3/run.sh 6.2.20 <deb> -e dataset_source=restore   # instead of seeding
+#
+# TRIAL at 1/30 scale (~10M, minutes):  ... RKC3/run.sh 6.2.20 <deb> -e lg_scale=0.0333
+#
+# CONTINUE on the lab as it is (-e dataset_source=existing): no teardown / restore / upgrade --
+# the node must already run v_new with lg_db on it (e.g. a run that gave up while the db was
+# still loading).  Picks up at step 3.  The 6.2 baseline comes from the file the last
+# seed/build/restore run of this dataset saved (~/.cache/ravendb-qa/...), or -- when there is
+# none -- from the expected values (exact totals, per-doc revision counts, attachment count).
+#   ... RKC3/run.sh 6.2.20 <deb> -e dataset_source=existing
+#
+# Docker mode only (log reads use `docker exec`).
+##################################################################################################
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/_internal/ensure_ravendb_venv.yml
+
+
+- name: Large dataset -- pre -- validate inputs and show plan
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - custom_build is defined
+          - custom_build is match('^https?://') or custom_build is file
+          - "'download' in ansible_skip_tags"
+          - target_mode | default('docker') == 'docker'
+          - lg_scale | float > 0
+          - lg_shapes | map(attribute='revs') | map('int') | max < lg_default_keep | int
+          - dataset_source in ['seed', 'build', 'restore', 'existing', 'local']
+          - dataset_source not in ['build', 'restore'] or dataset_s3_bucket | length > 0
+          - dataset_source not in ['build', 'restore'] or dataset_s3_region | length > 0
+          - dataset_source not in ['build', 'restore'] or lookup('env', 'AWS_ACCESS_KEY_ID') | length > 0
+          - dataset_source not in ['build', 'restore'] or lookup('env', 'AWS_SECRET_ACCESS_KEY') | length > 0
+          - lg_cleaner_during in ['required', 'optional', 'off']
+          - not (dataset_build_only | bool) or dataset_source == 'build'
+          - dataset_source != 'existing' or rkc_v62_version is defined
+        fail_msg: >-
+          Required: -e custom_build=<v_new .deb> AND --skip-tags download, docker mode, lg_scale > 0,
+          lg_default_keep above every shape's revs.  dataset_source seed|build|restore|existing|local -- build/restore
+          need RAVENDB_QA_S3_BUCKET, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.  dataset_build_only needs dataset_source=build.  existing needs -e rkc_v62_version (run.sh passes it).
+        quiet: true
+
+    - name: Scale the shapes
+      ansible.builtin.set_fact:
+        lg_base_url: "https://{{ lg_node }}.{{ ravendb_domain }}:443"
+        repo_root: "{{ playbook_dir }}/../../.."
+        lg_seed_log: "/tmp/rkc-large-seed-{{ lg_db }}.log"
+        lg_baseline_dir: "{{ lookup('env', 'HOME') }}/.cache/ravendb-qa/revision-key-cleanup"
+        lg_scaled: >-
+          {%- set out = [] -%}
+          {%- for s in lg_shapes -%}
+          {%- set docs = [(s.docs | int * lg_scale | float) | int, 1] | max -%}
+          {%- set att = [(s.att_docs | default(0) | int * lg_scale | float) | int, docs] | min -%}
+          {%- set _ = out.append(s | combine({'docs': docs, 'att_docs': att})) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    # Per doc: revs (+1 per attachment), capped at keep in the Pruned collection.
+    - name: Compute exact totals and the sample
+      ansible.builtin.set_fact:
+        lg_expected: >-
+          {%- set t = {'docs': 0, 'revisions': 0, 'tombstones_min': 0, 'unique_attachments': 0} -%}
+          {%- for s in lg_scaled -%}
+          {%- set every = s.att_every | default(0) | int -%}
+          {%- set n_att = s.att_docs if every > 0 else 0 -%}
+          {%- set per_att = s.revs + (s.revs // every if every > 0 else 0) -%}
+          {%- set per_plain = s.revs -%}
+          {%- if s.collection == 'Pruned' -%}
+          {%- set kept_att = [per_att, lg_pruned_keep | int] | min -%}
+          {%- set kept_plain = [per_plain, lg_pruned_keep | int] | min -%}
+          {%- set _ = t.update({'tombstones_min': t.tombstones_min + n_att * (per_att - kept_att)
+                                                  + (s.docs - n_att) * (per_plain - kept_plain)}) -%}
+          {%- set per_att, per_plain = kept_att, kept_plain -%}
+          {%- endif -%}
+          {%- set _ = t.update({'docs': t.docs + s.docs,
+                                'revisions': t.revisions + n_att * per_att + (s.docs - n_att) * per_plain,
+                                'unique_attachments': t.unique_attachments + n_att * (s.revs // every if every > 0 else 0)}) -%}
+          {%- endfor -%}
+          {{ t }}
+        # {id: {count, collection, keep}} -- first, last, and lg_sample_per_shape ids spread over
+        # the range by a large-stride walk (deterministic, so build and restore runs agree).
+        lg_sample: >-
+          {%- set out = {} -%}
+          {%- for s in lg_scaled -%}
+          {%- set every = s.att_every | default(0) | int -%}
+          {%- set nums = [0, s.docs - 1] -%}
+          {%- for i in range(lg_sample_per_shape | int) -%}
+          {%- set _ = nums.append((i * 104729 + 7919) % s.docs) -%}
+          {%- endfor -%}
+          {%- for n in nums | unique -%}
+          {%- set with_att = n < s.att_docs and every > 0 -%}
+          {%- set total = s.revs + ((s.revs // every) if with_att else 0) -%}
+          {%- set keep = lg_pruned_keep | int if s.collection == 'Pruned' else none -%}
+          {%- set _ = out.update({s.prefix ~ '/' ~ n: {'count': ([total, keep] | min) if keep else total,
+                                                        'atts': (s.revs // every) if with_att else 0,
+                                                        'collection': s.collection, 'keep': keep}}) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+        lg_shape_hash: >-
+          {{ ({'db': lg_db, 'shapes': lg_shapes, 'scale': lg_scale | float,
+               'default_keep': lg_default_keep | int, 'pruned_keep': lg_pruned_keep | int,
+               'tombstone_interval': lg_tombstone_cleanup_interval_min | int}
+              | to_json(sort_keys=true) | hash('sha1'))[:12] }}
+
+    - name: Keep the sample id lists
+      ansible.builtin.set_fact:
+        lg_sample_ids: "{{ lg_sample.keys() | list }}"
+        lg_sample_pruned_ids: "{{ lg_sample | dict2items | selectattr('value.collection', '==', 'Pruned') | map(attribute='key') | list }}"
+
+    - name: Show plan
+      ansible.builtin.debug:
+        msg: >-
+          Plan -- revisions key cleanup on a large dataset:  node={{ lg_node }}  db={{ lg_db }}  scale={{ lg_scale }}
+          docs={{ lg_expected.docs }}  revisions={{ lg_expected.revisions }}
+          (docs+revisions={{ lg_expected.docs + lg_expected.revisions }})
+          revision tombstones>={{ lg_expected.tombstones_min }}  unique attachments={{ lg_expected.unique_attachments }}
+          sample={{ lg_sample_ids | length }} docs  dataset={{ dataset_source }} ({{ lg_shape_hash }})
+          v_new={{ custom_build }}
+
+
+- name: Large dataset -- step 1 -- seed or restore on 6.2 and record the baseline
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    # ---- dataset_source=existing: the db is already on v_new -- take the baseline, skip the rest
+    - name: existing -- look for the baseline saved by the last run of this dataset
+      ansible.builtin.stat:
+        path: "{{ lg_baseline_dir }}/large_dataset-{{ rkc_v62_version }}-{{ lg_shape_hash }}.json"
+      register: _baseline_file
+      when: dataset_source == 'existing'
+
+    - name: existing -- take the 6.2 baseline (saved file, else the expected values)
+      ansible.builtin.set_fact:
+        v_before: { json: { FullVersion: "{{ rkc_v62_version }}" } }
+        lg_baseline: "{{ _saved if _baseline_file.stat.exists else _expected }}"
+      vars:
+        _saved: "{{ lookup('file', _baseline_file.stat.path) | from_json | combine({'source': 'saved ' ~ _baseline_file.stat.path}) }}"
+        # The seeded data has exactly the floor's revision tombstones and nothing else.
+        # Fingerprints unknown -> step 4 checks counts only.
+        _expected:
+          source: expected values (no saved baseline -- per-doc revision content not compared)
+          stats:
+            CountOfDocuments: "{{ lg_expected.docs }}"
+            CountOfRevisionDocuments: "{{ lg_expected.revisions }}"
+            CountOfUniqueAttachments: "{{ lg_expected.unique_attachments }}"
+            CountOfTombstones: "{{ lg_expected.tombstones_min }}"
+          fingerprints: {}
+          attachments_checked: "{{ lg_sample.values() | map(attribute='atts') | sum }}"
+      when: dataset_source == 'existing'
+
+    - name: existing -- use it
+      ansible.builtin.set_fact:
+        stats_before: { json: "{{ lg_baseline.stats }}" }
+        fp_before: "{{ lg_baseline.fingerprints }}"
+        attachments_checked_before: "{{ lg_baseline.attachments_checked }}"
+      when: dataset_source == 'existing'
+
+    - name: existing -- baseline
+      ansible.builtin.debug:
+        msg:
+          - "dataset          existing {{ lg_db }} on {{ lg_node }} (no seed / restore / upgrade in this run)"
+          - "baseline         {{ lg_baseline.source }}"
+          - "docs             {{ stats_before.json.CountOfDocuments }}"
+          - "revisions        {{ stats_before.json.CountOfRevisionDocuments }}"
+          - "tombstones       {{ stats_before.json.CountOfTombstones }}"
+          - "attachments      {{ stats_before.json.CountOfUniqueAttachments }} unique, {{ attachments_checked_before }} in the sample"
+      when: dataset_source == 'existing'
+
+    - name: existing -- skip the rest of step 1
+      ansible.builtin.meta: end_play
+      when: dataset_source == 'existing'
+
+    # ---- seed / build / restore
+    - name: Read server version
+      ansible.builtin.uri:
+        url: "{{ lg_base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_before
+
+    - name: Assert the node is on 6.2
+      ansible.builtin.assert:
+        that: v_before.json.FullVersion is match('^6\.2\.')
+        fail_msg: "Expected a 6.2 node, got {{ v_before.json.FullVersion }} -- install with -e rdb_version=6.2.x"
+
+    - name: Locate this dataset's snapshot folder in S3
+      ansible.builtin.set_fact:
+        dataset_node: "{{ lg_node }}"
+        dataset_s3_folder: "{{ dataset_s3_prefix }}/large_dataset/{{ v_before.json.FullVersion }}/{{ lg_shape_hash }}"
+
+    - name: local -- is there a local snapshot of this dataset?
+      ansible.builtin.stat:
+        path: "{{ dataset_local_root }}/large_dataset/{{ v_before.json.FullVersion }}/{{ lg_shape_hash }}/COMPLETE"
+      register: _local_snap
+      when: dataset_source == 'local'
+
+    - name: Where the 6.2 dataset comes from
+      ansible.builtin.set_fact:
+        lg_local_dir: "{{ dataset_local_root }}/large_dataset/{{ v_before.json.FullVersion }}/{{ lg_shape_hash }}"
+        lg_mode: >-
+          {{ (('local_restore' if _local_snap.stat.exists else 'local_build') if dataset_source == 'local'
+              else dataset_source) | trim }}
+
+    - name: Dataset source
+      ansible.builtin.debug:
+        msg: >-
+          {{ {'local_restore': 'restore the local snapshot in ' ~ lg_local_dir,
+              'local_build': 'no local snapshot yet -- seed, verify, save one to ' ~ lg_local_dir,
+              'seed': 'seed', 'build': 'seed + S3 snapshot', 'restore': 'restore the S3 snapshot',
+              'existing': 'the lab as it is'}[lg_mode] }}
+
+    - name: List existing snapshots (build / restore)
+      ansible.builtin.include_tasks: ../rkc-common/dataset_points.yml
+      when: dataset_source in ['build', 'restore']
+
+    - name: build -- refuse to upload a second snapshot of the same dataset
+      ansible.builtin.assert:
+        that: dataset_snapshots | length == 0
+        fail_msg: >-
+          s3://{{ dataset_s3_bucket }}/{{ dataset_s3_folder }} already holds
+          {{ dataset_snapshots | length }} snapshot(s) -- run with -e dataset_source=restore,
+          or delete the folder to rebuild.
+      when: dataset_source == 'build'
+
+    - name: restore -- a snapshot must exist
+      ansible.builtin.assert:
+        that: dataset_snapshots | length > 0
+        fail_msg: >-
+          No snapshot in s3://{{ dataset_s3_bucket }}/{{ dataset_s3_folder }} (6.2
+          {{ v_before.json.FullVersion }}, shape {{ lg_shape_hash }}) -- build it first with
+          -e dataset_source=build.
+      when: dataset_source == 'restore'
+
+    - name: local restore -- hard-link the snapshot into the lab's backups volume
+      become: true
+      ansible.builtin.shell: |
+        set -e
+        vol=$(docker volume inspect {{ backups_volume_name | default('lab_backups') }} -f '{{ '{{' }}.Mountpoint{{ '}}' }}')
+        rm -rf "$vol/rkc-local-restore"; mkdir -p "$vol/rkc-local-restore"
+        cp -al "{{ lg_local_dir }}/snapshot/." "$vol/rkc-local-restore/" 2>/dev/null \
+          || cp -a "{{ lg_local_dir }}/snapshot/." "$vol/rkc-local-restore/"
+        ls "$vol/rkc-local-restore" | tail -1
+      register: _local_in
+      changed_when: true
+      when: lg_mode == 'local_restore'
+
+    - name: local restore -- restore it as {{ lg_db }} (progress in /tmp/rkc-large-restore-{{ lg_db }}.log)
+      ravendb_backup:
+        kind: restore
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ lg_node }}"
+        backup_path: "/backups/rkc-local-restore/{{ _local_in.stdout | trim }}"
+        new_db_name: "{{ lg_db }}"
+        timeout: "{{ dataset_local_timeout_secs | int }}"
+        poll_interval: 15
+        progress_log: "/tmp/rkc-large-restore-{{ lg_db }}.log"
+      register: _restored_local
+      when: lg_mode == 'local_restore'
+
+    - name: restore -- restore the newest snapshot as {{ lg_db }} (download + restore, can take hours)
+      ravendb_backup:
+        kind: restore
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ lg_node }}"
+        backup_path: "{{ dataset_snapshots[0].location }}"
+        new_db_name: "{{ lg_db }}"
+        timeout: "{{ dataset_s3_timeout_secs | int }}"
+        poll_interval: 15
+        progress_log: "/tmp/rkc-large-restore-{{ lg_db }}.log"
+        s3_bucket: "{{ dataset_s3_bucket }}"
+        s3_region: "{{ dataset_s3_region }}"
+        s3_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+        s3_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+        s3_session_token: "{{ lookup('env', 'AWS_SESSION_TOKEN') | default(omit, true) }}"
+      register: _restored
+      when: lg_mode == 'restore'
+
+    - name: Create {{ lg_db }} with the tombstone cleaner's timer off
+      ansible.builtin.uri:
+        url: "{{ lg_base_url }}/admin/databases?replicationFactor=1"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body:
+          DatabaseName: "{{ lg_db }}"
+          Settings:
+            Tombstones.CleanupIntervalInMin: "{{ lg_tombstone_cleanup_interval_min | string }}"
+        status_code: [201]
+      when: lg_mode not in ['restore', 'local_restore']
+
+    - name: Wait for {{ lg_db }} to come online
+      ansible.builtin.uri:
+        url: "{{ lg_base_url }}/databases/{{ lg_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 120
+      register: _online
+      retries: "{{ lg_db_load_retries | int }}"
+      delay: 5
+      until: _online is succeeded
+
+    - name: restore -- remove the backup task the snapshot carries (it would pin every tombstone)
+      ansible.builtin.include_tasks: ../rkc-common/dataset_restored.yml
+      vars:
+        dataset_db: "{{ lg_db }}"
+      when: lg_mode in ['restore', 'local_restore']
+
+    - name: Configure revisions (Default keep {{ lg_default_keep }}, Pruned keep {{ lg_pruned_keep }})
+      ravendb_revisions:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ lg_node }}"
+        db_name: "{{ lg_db }}"
+        default_keep: "{{ lg_default_keep | int }}"
+        default_max_age_secs: 0
+        collections_config: "{{ {'Pruned': {'keep': lg_pruned_keep | int, 'max_age_secs': 0}} }}"
+      when: lg_mode not in ['restore', 'local_restore']
+
+    - name: Seeding -- follow progress with `tail -F {{ lg_seed_log }}`
+      ansible.builtin.debug:
+        msg: "~{{ ((lg_expected.revisions + lg_expected.unique_attachments) / 40000 / 60) | round | int }} min at ~40k writes/s"
+      when: lg_mode not in ['restore', 'local_restore']
+
+    - name: Seed shapes
+      ansible.builtin.shell: |
+        set -o pipefail
+        python3 "{{ repo_root }}/scripts/revisions_loader.py" \
+          --target={{ lg_node }} --domain={{ ravendb_domain }} \
+          --cert={{ cert_dir }}/client.pem --ca={{ cert_ca_crt }} --db={{ lg_db }} \
+          --collection={{ item.collection }} --id-prefix={{ item.prefix }} \
+          --docs={{ item.docs }} --revs={{ item.revs }} --pad-bytes={{ item.pad_bytes | default(0) }} \
+          --att-docs={{ item.att_docs | default(0) }} --att-every={{ item.att_every | default(0) }} \
+          --att-size={{ item.att_size | default(256) }} \
+          --threads={{ lg_loader_threads }} --batch={{ lg_loader_batch }} --progress-secs=30 \
+          2>&1 | tee -a "{{ lg_seed_log }}"
+      args:
+        executable: /bin/bash
+      loop: "{{ lg_scaled }}"
+      loop_control: { label: "{{ item.name }} ({{ item.docs }} docs)" }
+      register: _seed
+      changed_when: true
+      when: lg_mode not in ['restore', 'local_restore']
+
+    - name: Loader summary
+      ansible.builtin.debug:
+        msg: "{{ _seed.results | map(attribute='stdout_lines') | map('last') | list }}"
+      when: lg_mode not in ['restore', 'local_restore']
+
+    - name: Fingerprint the sample and read its attachments back (before)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ lg_node }}"
+        db_name: "{{ lg_db }}"
+        ids: "{{ lg_sample_ids }}"
+        verify_attachment_content: true
+      register: _fp
+
+    - name: Keep the before fingerprints
+      ansible.builtin.set_fact:
+        fp_before: "{{ _fp.fingerprints }}"
+        attachments_checked_before: "{{ _fp.attachments_checked }}"
+
+    - name: Assert exact revision count for every sampled doc on 6.2
+      ansible.builtin.assert:
+        that: _wrong | length == 0
+        fail_msg: "{{ _wrong | length }} sampled doc(s) with an unexpected revision count (first 20, got != expected): {{ _wrong[:20] }}"
+      vars:
+        _wrong: >-
+          {%- set out = [] -%}
+          {%- for k, v in lg_sample.items() if fp_before[k].count != v.count -%}
+          {%- set _ = out.append(k ~ ': ' ~ fp_before[k].count ~ ' != ' ~ v.count) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Read /stats (before)
+      ansible.builtin.uri:
+        url: "{{ lg_base_url }}/databases/{{ lg_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 300
+      register: stats_before
+
+    - name: Tombstones by kind on 6.2
+      ansible.builtin.include_tasks: ../rkc-common/tombstone_kinds.yml
+      vars: { tk_node: "{{ lg_node }}", tk_db: "{{ lg_db }}" }
+
+    - name: Keep them
+      ansible.builtin.set_fact:
+        kinds_before: "{{ tombstone_kinds }}"
+
+    - name: Assert exact totals on 6.2 (and the revision tombstones are still there)
+      ansible.builtin.assert:
+        that:
+          - kinds_before.revisions | int >= lg_expected.tombstones_min | int
+          - kinds_before.total | int == stats_before.json.CountOfTombstones | int
+          - stats_before.json.CountOfDocuments | int == lg_expected.docs | int
+          - stats_before.json.CountOfRevisionDocuments | int == lg_expected.revisions | int
+          - stats_before.json.CountOfUniqueAttachments | int == lg_expected.unique_attachments | int
+          - stats_before.json.CountOfTombstones | int >= lg_expected.tombstones_min | int
+        fail_msg: >-
+          docs {{ stats_before.json.CountOfDocuments }} (expected {{ lg_expected.docs }}),
+          revisions {{ stats_before.json.CountOfRevisionDocuments }} (expected {{ lg_expected.revisions }}),
+          unique attachments {{ stats_before.json.CountOfUniqueAttachments }} (expected {{ lg_expected.unique_attachments }}),
+          tombstones {{ stats_before.json.CountOfTombstones }} (expected >= {{ lg_expected.tombstones_min }}
+          revision tombstones; by kind {{ kinds_before }})
+
+    # Same data on every seed/build/restore of this shape, so a later -e dataset_source=existing
+    # run can compare the sample's revision content too, not just counts.
+    - name: Baseline folder
+      ansible.builtin.file:
+        path: "{{ lg_baseline_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Save the 6.2 baseline for a later -e dataset_source=existing run
+      ansible.builtin.copy:
+        dest: "{{ lg_baseline_dir }}/large_dataset-{{ v_before.json.FullVersion }}-{{ lg_shape_hash }}.json"
+        content: >-
+          {{ {'version': v_before.json.FullVersion, 'shape_hash': lg_shape_hash,
+              'stats': stats_before.json | dict2items | selectattr('key', 'in',
+                       ['CountOfDocuments', 'CountOfRevisionDocuments', 'CountOfUniqueAttachments',
+                        'CountOfTombstones']) | items2dict,
+              'fingerprints': fp_before, 'attachments_checked': attachments_checked_before | int}
+             | to_json }}
+        mode: "0644"
+
+    # Only after every baseline assertion passed -- a snapshot of bad data must never be stored.
+    - name: build -- upload a snapshot of {{ lg_db }} to S3 (can take hours; progress in /tmp/rkc-large-backup-{{ lg_db }}.log)
+      ravendb_backup:
+        kind: backup
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ lg_node }}"
+        db_name: "{{ lg_db }}"
+        backup_type: Snapshot
+        timeout: "{{ dataset_s3_timeout_secs | int }}"
+        poll_interval: 15
+        progress_log: "/tmp/rkc-large-backup-{{ lg_db }}.log"
+        s3_bucket: "{{ dataset_s3_bucket }}"
+        s3_region: "{{ dataset_s3_region }}"
+        s3_folder: "{{ dataset_s3_folder }}"
+        s3_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+        s3_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+        s3_session_token: "{{ lookup('env', 'AWS_SESSION_TOKEN') | default(omit, true) }}"
+      register: _uploaded
+      when: dataset_source == 'build'
+
+    - name: build -- confirm the snapshot is listed
+      ansible.builtin.include_tasks: ../rkc-common/dataset_points.yml
+      when: dataset_source == 'build'
+
+    - name: build -- assert exactly one snapshot now
+      ansible.builtin.assert:
+        that: dataset_snapshots | length == 1
+        fail_msg: "expected 1 snapshot in s3://{{ dataset_s3_bucket }}/{{ dataset_s3_folder }}, found {{ dataset_snapshots | length }}"
+      when: dataset_source == 'build'
+
+    # Only after every baseline assertion passed -- a snapshot of bad data must never be stored.
+    - name: local build -- snapshot {{ lg_db }} into the lab's backups volume (progress in /tmp/rkc-large-backup-{{ lg_db }}.log)
+      ravendb_backup:
+        kind: backup
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ lg_node }}"
+        db_name: "{{ lg_db }}"
+        backup_type: Snapshot
+        backup_path: /backups/rkc-local-snapshot
+        timeout: "{{ dataset_local_timeout_secs | int }}"
+        poll_interval: 15
+        progress_log: "/tmp/rkc-large-backup-{{ lg_db }}.log"
+      register: _uploaded_local
+      when: lg_mode == 'local_build'
+
+    - name: local build -- move it out of the lab to {{ lg_local_dir }} (kept across teardowns)
+      become: true
+      ansible.builtin.shell: |
+        set -e
+        vol=$(docker volume inspect {{ backups_volume_name | default('lab_backups') }} -f '{{ '{{' }}.Mountpoint{{ '}}' }}')
+        test -n "$(ls -A "$vol/rkc-local-snapshot")"
+        rm -rf "{{ lg_local_dir }}"; mkdir -p "{{ lg_local_dir }}"
+        mv "$vol/rkc-local-snapshot" "{{ lg_local_dir }}/snapshot"
+        echo "$(du -sh "{{ lg_local_dir }}/snapshot" | cut -f1) in {{ lg_local_dir }}"
+        date -u +%FT%TZ > "{{ lg_local_dir }}/COMPLETE"
+      register: _local_saved
+      changed_when: true
+      when: lg_mode == 'local_build'
+
+    # The backup ran through a periodic-backup task on the live db; left there, it would pin every
+    # tombstone and the tombstone cleaner would delete nothing (see dataset_restored.yml).
+    - name: build -- remove the backup task from {{ lg_db }}
+      ansible.builtin.include_tasks: ../rkc-common/dataset_restored.yml
+      vars:
+        dataset_db: "{{ lg_db }}"
+      when: lg_mode in ['build', 'local_build']
+
+    - name: Baseline summary
+      ansible.builtin.debug:
+        msg:
+          - "version          {{ v_before.json.FullVersion }}"
+          - "dataset          {{ {'seed': 'seeded (no snapshot)', 'build': 'seeded + ' ~ (_uploaded.msg | default('')), 'restore': (_restored.msg | default('')), 'local_restore': (_restored_local.msg | default('')), 'local_build': 'seeded + local snapshot ' ~ (_local_saved.stdout | default('')), 'existing': 'existing'}[lg_mode] }}"
+          - "docs             {{ stats_before.json.CountOfDocuments }}"
+          - "revisions        {{ stats_before.json.CountOfRevisionDocuments }}"
+          - "tombstones       {{ stats_before.json.CountOfTombstones }}  (>= {{ lg_expected.tombstones_min }} revision tombstones)"
+          - "attachments      {{ stats_before.json.CountOfUniqueAttachments }} unique, {{ attachments_checked_before }} read back from the sample"
+          - "size on disk     {{ stats_before.json.SizeOnDisk.HumaneSize | default('?') }}"
+
+
+    - name: Data file + journal sizes on 6.2
+      ansible.builtin.include_tasks: ../rkc-common/size_snapshot.yml
+      vars: { size_node: "{{ lg_node }}", size_dbs: ["{{ lg_db }}"], size_label: "on 6.2 ({{ dataset_source }})" }
+
+    # -e dataset_build_only=true: stop once the snapshot is safely in S3 (short run, less exposed
+    # to the machine restarting); test later with -e dataset_source=restore.
+    - name: build only -- stop here?
+      ansible.builtin.set_fact:
+        stop_after_build: "{{ dataset_source == 'build' and dataset_build_only | bool }}"
+
+    - name: "RESULT: dataset snapshot built -- stopping before the upgrade (build only)"
+      ansible.builtin.debug:
+        msg:
+          - "BUILT: 6.2 dataset verified and uploaded to s3://{{ dataset_s3_bucket }}/{{ dataset_s3_folder }}"
+          - "{{ _uploaded.msg | default('') }}"
+          - "Test it any time with -e dataset_source=restore (same 6.2 version and vars)."
+      when: stop_after_build | bool
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  when: not (hostvars['localhost'].stop_after_build | default(false)) and dataset_source != 'existing'
+  vars:
+    # Play-level `hosts:` there is templated from `target` before vars files load; keep the
+    # default in sync with lg_node in vars.yml.
+    target: "{{ lg_node | default('1a') }}"
+
+
+- name: Large dataset -- step 3 -- run the key cleanup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: build only -- nothing to do
+      ansible.builtin.meta: end_play
+      when: hostvars['localhost'].stop_after_build | default(false)
+
+    - name: Read server version (after upgrade)
+      ansible.builtin.uri:
+        url: "{{ lg_base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_after
+      retries: "{{ lg_db_load_retries | int }}"
+      delay: 5
+      until: v_after is succeeded
+
+    - name: Assert the version changed
+      ansible.builtin.assert:
+        that: v_after.json.FullVersion != v_before.json.FullVersion
+        fail_msg: "still on {{ v_after.json.FullVersion }} -- the upgrade did not install custom_build"
+
+    - name: Key cleanup starts
+      ansible.builtin.set_fact:
+        t_kc_start: "{{ lookup('pipe', 'date +%s.%N') }}"
+
+    - name: Start the size sampler (data file + journals, every {{ lg_size_interval_secs }}s -> {{ lg_size_csv }})
+      ansible.builtin.include_tasks: ../rkc-common/size_sample_start.yml
+      vars:
+        size_node: "{{ lg_node }}"
+        size_dbs: ["{{ lg_db }}"]
+        size_csv: "{{ lg_size_csv }}"
+        size_max_secs: "{{ (lg_first_load_timeout_secs | int) + (cleanup_timeout_secs | int) + 600 }}"
+        size_interval_secs: "{{ lg_size_interval_secs }}"
+
+    - name: Clear the metrics files of an earlier run (a stale .stop would end the sampler at once)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: ["{{ lg_metrics_csv }}", "{{ lg_metrics_csv }}.stop"]
+
+    - name: Start the metrics sampler (CPU, memory, disk I/O of {{ lg_node }}, every {{ lg_metrics_interval_secs }}s -> {{ lg_metrics_csv }})
+      ansible.builtin.command:
+        argv: [python3, "{{ repo_root }}/scripts/container_metrics.py", sample, --container, "{{ lg_node }}",
+               --interval, "{{ lg_metrics_interval_secs | string }}", --out, "{{ lg_metrics_csv }}",
+               --stop-file, "{{ lg_metrics_csv }}.stop", --max-secs, "{{ _bg_secs | string }}"]
+      async: "{{ _bg_secs | int + 120 }}"
+      poll: 0
+      register: _metrics_job
+      changed_when: false
+      vars:
+        _bg_secs: "{{ (lg_first_load_timeout_secs | int) + (cleanup_timeout_secs | int) + 600 }}"
+
+    - name: Key cleanup, with the sizes and metrics summarized even if it stops early
+      block:
+        - name: Run the key cleanup (and the tombstone cleaner during it)
+          ansible.builtin.include_tasks: ../rkc-common/run_key_cleanup.yml
+          vars:
+            kc_node: "{{ lg_node }}"
+            kc_db: "{{ lg_db }}"
+            kc_cleaner_during: "{{ lg_cleaner_during }}"
+            # none with dataset_source=existing (no 6.2 count): the cleaner's run is then only reported
+            kc_revision_tombstones_before: "{{ (kinds_before | default({})).revisions | default('') }}"
+            kc_load_timeout_secs: "{{ lg_first_load_timeout_secs }}"
+            cleanup_universe: "{{ lg_scaled }}"     # early stop: see cleanup_max_hours in vars.yml
+      always:
+        - name: Key cleanup ends
+          ansible.builtin.set_fact:
+            t_kc_end: "{{ lookup('pipe', 'date +%s.%N') }}"
+
+        # first load = the 6.2 -> 7.x schema upgrade (db offline); cleanup = after it
+        - name: Stop the size sampler, summarize per window
+          ansible.builtin.include_tasks: ../rkc-common/size_sample_stop.yml
+          vars:
+            size_csv: "{{ lg_size_csv }}"
+            size_windows_spec: >-
+              {{ ['first load:' ~ t_kc_start ~ ':' ~ ((t_kc_start | float) + (db_load_secs | int)),
+                  'cleanup:' ~ ((t_kc_start | float) + (db_load_secs | int)) ~ ':' ~ t_kc_end]
+                 if db_load_secs is defined else ['load + cleanup (stopped):' ~ t_kc_start ~ ':' ~ t_kc_end] }}
+
+        - name: Sizes so far
+          ansible.builtin.include_tasks: ../rkc-common/size_report.yml
+
+        - name: Stop the metrics sampler
+          ansible.builtin.file:
+            path: "{{ lg_metrics_csv }}.stop"
+            state: touch
+            mode: "0644"
+
+        - name: Wait for it to exit
+          ansible.builtin.async_status:
+            jid: "{{ _metrics_job.ansible_job_id }}"
+          register: _metrics_bg
+          until: _metrics_bg.finished
+          retries: 30
+          delay: 2
+
+        - name: Summarize the metrics per window
+          ansible.builtin.command:
+            argv: "{{ [ansible_playbook_python, repo_root ~ '/scripts/container_metrics.py', 'summarize',
+                       '--csv', lg_metrics_csv] + (_windows | map('regex_replace', '^', '--window=') | list) }}"
+          register: _metrics_sum
+          changed_when: false
+          vars:
+            _windows: >-
+              {{ ['first load:' ~ t_kc_start ~ ':' ~ ((t_kc_start | float) + (db_load_secs | int)),
+                  'cleanup:' ~ ((t_kc_start | float) + (db_load_secs | int)) ~ ':' ~ t_kc_end]
+                 if db_load_secs is defined else ['load + cleanup (stopped):' ~ t_kc_start ~ ':' ~ t_kc_end] }}
+
+        - name: Keep the metrics summary
+          ansible.builtin.set_fact:
+            metrics_windows: "{{ _metrics_sum.stdout | from_json }}"
+
+        - name: Save the metrics summary -> {{ lg_metrics_json }}
+          ansible.builtin.copy:
+            dest: "{{ lg_metrics_json }}"
+            mode: "0644"
+            content: "{{ {'node': lg_node, 'db': lg_db, 'interval_secs': lg_metrics_interval_secs | int,
+                          'windows': metrics_windows,
+                          'cleanup_epoch': [t_kc_start | float, t_kc_end | float],
+                          'notes': ['cpu_pct: 100 = one full core',
+                                    'mem_anon_mb: the server process (no page cache); mem_mb: with the page cache Voron maps',
+                                    'peaks are per sample interval'] } | to_nice_json }}"
+
+        - name: CPU / memory / disk I/O per window
+          ansible.builtin.debug:
+            msg: >-
+              {%- set out = [] -%}
+              {%- for w, m in metrics_windows.items() -%}
+              {%- if m.cpu_pct_avg is defined -%}
+              {%- set _ = out.append(w ~ ' (' ~ ((m.secs / 3600) | round(1)) ~ ' h): CPU avg ' ~ m.cpu_pct_avg ~ '% peak '
+                    ~ m.cpu_pct_peak ~ '% | memory (no cache) avg ' ~ ((m.mem_anon_mb_avg | default(0) / 1024) | round(1))
+                    ~ ' GB peak ' ~ ((m.mem_anon_mb_peak | default(0) / 1024) | round(1)) ~ ' GB, with cache peak '
+                    ~ ((m.mem_mb_peak / 1024) | round(1)) ~ ' GB | read ' ~ m.read_mb_s_avg ~ ' MB/s avg ('
+                    ~ m.read_mb_total ~ ' MB) | write ' ~ m.write_mb_s_avg ~ ' MB/s avg (' ~ m.write_mb_total
+                    ~ ' MB) | ' ~ m.iops_avg ~ ' IOPS avg') -%}
+              {%- else -%}
+              {%- set _ = out.append(w ~ ': ' ~ m) -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {{ out }}
+
+
+- name: Large dataset -- step 4 -- verify after the key cleanup, then run the tombstone cleaner
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: build only -- nothing to do
+      ansible.builtin.meta: end_play
+      when: hostvars['localhost'].stop_after_build | default(false)
+
+    - name: Fingerprint the sample and read its attachments back (after)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ lg_node }}"
+        db_name: "{{ lg_db }}"
+        ids: "{{ lg_sample_ids }}"
+        verify_attachment_content: true
+      register: _fp_after
+
+    # With no saved baseline (dataset_source=existing) fp_before is empty: counts only.
+    - name: Assert every sampled doc's revisions unchanged
+      ansible.builtin.assert:
+        that: _diff | length == 0
+        fail_msg: "{{ _diff | length }} sampled doc(s) changed (first 20, before -> after): {{ _diff[:20] }}"
+      vars:
+        _diff: >-
+          {%- set out = [] -%}
+          {%- for k, e in lg_sample.items() -%}
+          {%- set a = _fp_after.fingerprints[k] -%}
+          {%- set v = fp_before[k] if k in fp_before else {'count': e.count} -%}
+          {%- if (k in fp_before and a != v) or a.count != v.count -%}
+          {%- set _ = out.append(k ~ ': ' ~ v.count ~ ' -> ' ~ a.count ~
+                ('' if v.count != a.count else ' (same count, content/attachments differ)')) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Assert every sampled attachment was read back again
+      ansible.builtin.assert:
+        that: _fp_after.attachments_checked | int == attachments_checked_before | int
+        fail_msg: "read back {{ _fp_after.attachments_checked }} attachments, expected {{ attachments_checked_before }}"
+
+    - name: Read /stats (after the key cleanup)
+      ansible.builtin.uri:
+        url: "{{ lg_base_url }}/databases/{{ lg_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 300
+      register: stats_after
+
+    # Key cleanup removes nothing (DEV).  The tombstone cleaner ran during it: it may delete the
+    # NON-revision tombstones (DEV), so the total drops by exactly what it deleted, and
+    # the revision tombstones are as on 6.2.
+    - name: Tombstones by kind after the key cleanup
+      ansible.builtin.include_tasks: ../rkc-common/tombstone_kinds.yml
+      vars: { tk_node: "{{ lg_node }}", tk_db: "{{ lg_db }}" }
+
+    - name: Assert totals unchanged by the key cleanup (docs, revisions, attachments, revision tombstones)
+      ansible.builtin.assert:
+        that:
+          - stats_after.json.CountOfDocuments | int == stats_before.json.CountOfDocuments | int
+          - stats_after.json.CountOfRevisionDocuments | int == stats_before.json.CountOfRevisionDocuments | int
+          - stats_after.json.CountOfUniqueAttachments | int == stats_before.json.CountOfUniqueAttachments | int
+          - stats_after.json.CountOfTombstones | int == (stats_before.json.CountOfTombstones | int) - (_deleted_during | int)
+          - kinds_before is not defined or tombstone_kinds.revisions | int == kinds_before.revisions | int
+      vars:
+        _deleted_during: "{{ (cleaner_during | default({})).deleted | default(0) }}"
+        fail_msg: >-
+          before -> after: docs {{ stats_before.json.CountOfDocuments }} -> {{ stats_after.json.CountOfDocuments }},
+          revisions {{ stats_before.json.CountOfRevisionDocuments }} -> {{ stats_after.json.CountOfRevisionDocuments }},
+          unique attachments {{ stats_before.json.CountOfUniqueAttachments }} -> {{ stats_after.json.CountOfUniqueAttachments }},
+          tombstones {{ stats_before.json.CountOfTombstones }} -> {{ stats_after.json.CountOfTombstones }}
+          (the cleaner deleted {{ _deleted_during }} during the key cleanup), by kind
+          {{ kinds_before | default('?') }} -> {{ tombstone_kinds }}
+
+    - name: No orphan revisions (server-side scan, up to {{ lg_orphan_check_budget_secs }}s)
+      ravendb_diagnostic:
+        kind: orphan_revisions
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        db_name: "{{ lg_db }}"
+        nodes: ["{{ lg_node }}"]
+        assert_mode: true
+        budget_secs: "{{ lg_orphan_check_budget_secs | int }}"
+      register: _orphans
+
+    - name: Run the tombstone cleaner by hand (key cleanup is done -- it may delete everything now)
+      ansible.builtin.uri:
+        url: "{{ lg_base_url }}/databases/{{ lg_db }}/admin/tombstones/cleanup"
+        method: POST
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 7200
+      register: _cleaner
+
+    - name: Read /stats (after the tombstone cleaner)
+      ansible.builtin.uri:
+        url: "{{ lg_base_url }}/databases/{{ lg_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 300
+      register: stats_cleaned
+
+    - name: Assert the tombstone cleaner deleted every tombstone
+      ansible.builtin.assert:
+        that:
+          - stats_cleaned.json.CountOfTombstones | int == 0
+          - _cleaner.json.Value | int == stats_after.json.CountOfTombstones | int
+        fail_msg: >-
+          tombstone cleaner deleted {{ _cleaner.json.Value }} of {{ stats_after.json.CountOfTombstones }},
+          {{ stats_cleaned.json.CountOfTombstones }} left
+
+    - name: Data file + journal sizes after the tombstone cleaner
+      ansible.builtin.include_tasks: ../rkc-common/size_snapshot.yml
+      vars: { size_node: "{{ lg_node }}", size_dbs: ["{{ lg_db }}"], size_label: "after the tombstone cleaner" }
+
+    - name: Count key-cleanup log lines before the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ lg_node }}"
+
+    - name: Keep the count from before the restart
+      ansible.builtin.set_fact:
+        lines_before_restart: "{{ cleanup_line_count }}"
+
+    - name: Post-key-cleanup summary
+      ansible.builtin.debug:
+        msg:
+          - "version          {{ v_before.json.FullVersion }} -> {{ v_after.json.FullVersion }}"
+          - "key cleanup      {{ cleanup_line_total }} log lines"
+          - "docs             {{ stats_before.json.CountOfDocuments }} -> {{ stats_after.json.CountOfDocuments }}"
+          - "revisions        {{ stats_before.json.CountOfRevisionDocuments }} -> {{ stats_after.json.CountOfRevisionDocuments }}"
+          - "tombstones       {{ stats_before.json.CountOfTombstones }} -> {{ stats_after.json.CountOfTombstones }} (key cleanup) -> {{ stats_cleaned.json.CountOfTombstones }} (tombstone cleaner deleted {{ _cleaner.json.Value }})"
+          - "attachments      {{ stats_after.json.CountOfUniqueAttachments }} unique, {{ _fp_after.attachments_checked }} read back from the sample"
+          - "{{ _orphans.msg }}"
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/restart_ravendb.yml
+  when: not (hostvars['localhost'].stop_after_build | default(false))
+  vars:
+    target: "{{ lg_node | default('1a') }}"
+
+- name: Large dataset -- step 5 -- the key cleanup must not run again after restart
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: build only -- nothing to do
+      ansible.builtin.meta: end_play
+      when: hostvars['localhost'].stop_after_build | default(false)
+
+    - name: Load {{ lg_db }} again
+      ansible.builtin.uri:
+        url: "{{ lg_base_url }}/databases/{{ lg_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 120
+      register: _reload
+      retries: "{{ lg_db_load_retries | int }}"
+      delay: 5
+      until: _reload is succeeded
+
+    - name: Watch the log for {{ rerun_quiet_secs }}s
+      ansible.builtin.pause:
+        seconds: "{{ rerun_quiet_secs | int }}"
+
+    - name: Count key-cleanup log lines after the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ lg_node }}"
+
+    - name: Assert no new key-cleanup lines
+      ansible.builtin.assert:
+        that: cleanup_line_count | int == lines_before_restart | int
+        fail_msg: "key cleanup ran again after restart: {{ lines_before_restart }} -> {{ cleanup_line_count }} cleanup log lines"
+
+    - name: Fingerprint the sample again (after restart)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ lg_node }}"
+        db_name: "{{ lg_db }}"
+        ids: "{{ lg_sample_ids }}"
+      register: _fp_restart
+
+    - name: Assert the sample still unchanged
+      ansible.builtin.assert:
+        that: _fp_restart.fingerprints == _fp_after.fingerprints
+        fail_msg: "sampled revision fingerprints changed after restart"
+
+
+    - name: Data file + journal sizes after the restart
+      ansible.builtin.include_tasks: ../rkc-common/size_snapshot.yml
+      vars: { size_node: "{{ lg_node }}", size_dbs: ["{{ lg_db }}"], size_label: "after restart" }
+
+
+- name: Large dataset -- step 6 -- next write prunes back to keep
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: build only -- nothing to do
+      ansible.builtin.meta: end_play
+      when: hostvars['localhost'].stop_after_build | default(false)
+
+    - name: Write once more to every sampled pruned doc
+      ansible.builtin.uri:
+        url: "{{ lg_base_url }}/databases/{{ lg_db }}/docs?id={{ item | urlencode }}"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body:
+          v: next-write
+          "@metadata": { "@collection": "Pruned" }
+        status_code: [201]
+      loop: "{{ lg_sample_pruned_ids }}"
+
+    - name: Fingerprint the written docs
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ lg_node }}"
+        db_name: "{{ lg_db }}"
+        ids: "{{ lg_sample_pruned_ids }}"
+      register: _fp_written
+
+    - name: Assert every written doc is back to exactly keep
+      ansible.builtin.assert:
+        that: _wrong | length == 0
+        fail_msg: "{{ _wrong | length }} doc(s) not at keep after the next write (first 20): {{ _wrong[:20] }}"
+      vars:
+        _wrong: >-
+          {%- set out = [] -%}
+          {%- for k in lg_sample_pruned_ids if _fp_written.fingerprints[k].count != lg_pruned_keep | int -%}
+          {%- set _ = out.append(k ~ ': ' ~ _fp_written.fingerprints[k].count) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Read /stats (after the next write)
+      ansible.builtin.uri:
+        url: "{{ lg_base_url }}/databases/{{ lg_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 300
+      register: stats_written
+
+    - name: Assert the pruning left its revision tombstones (one per written doc, at least)
+      ansible.builtin.assert:
+        that: stats_written.json.CountOfTombstones | int >= lg_sample_pruned_ids | length
+        fail_msg: "tombstones {{ stats_written.json.CountOfTombstones }} after the next write, expected >= {{ lg_sample_pruned_ids | length }}"
+
+    - name: Data file + journal sizes after the next write
+      ansible.builtin.include_tasks: ../rkc-common/size_snapshot.yml
+      vars: { size_node: "{{ lg_node }}", size_dbs: ["{{ lg_db }}"], size_label: "after the next write" }
+
+    - name: Sizes
+      ansible.builtin.include_tasks: ../rkc-common/size_report.yml
+
+    - name: Save the sizes ({{ lg_size_json }})
+      ansible.builtin.copy:
+        content: "{{ {'snapshots': size_snapshots, 'windows': size_windows | default({})} | to_nice_json }}"
+        dest: "{{ lg_size_json }}"
+        mode: "0644"
+
+    - name: "RESULT: revisions key cleanup on a large dataset -- PASSED"
+      ansible.builtin.debug:
+        msg:
+          - "PASSED: revisions key cleanup on a large dataset, upgraded in place {{ v_before.json.FullVersion }} -> {{ v_after.json.FullVersion }}"
+          - "Dataset:  {{ stats_before.json.CountOfDocuments }} docs + {{ stats_before.json.CountOfRevisionDocuments }} revisions, {{ stats_before.json.CountOfTombstones }} tombstones, {{ stats_before.json.CountOfUniqueAttachments }} attachments ({{ dataset_source }}{{ ', scale ' ~ lg_scale if lg_scale | float != 1 else '' }})"
+          - "Key cleanup ran: {% set l = cleanup_lines.stdout_lines | default([]) | sort -%}{{ (l | first)[:19] ~ ' -> ' ~ (l | last)[:19] ~ ' UTC' if l else 'no log lines' }}"
+          - "OK  totals unchanged by the key cleanup; {{ lg_sample_ids | length }} sampled docs' revisions unchanged, {{ attachments_checked_before }} attachments read back intact"
+          - "OK  revision tombstones kept through the key cleanup; the tombstone cleaner {{ ('ran during it and deleted ' ~ cleaner_during.deleted ~ ' non-revision tombstones only') if (cleaner_during | default({})).outcome | default('') == 'TRIGGERED' else 'was not run during it (lg_cleaner_during=' ~ lg_cleaner_during ~ ')' }}, then deleted all {{ _cleaner.json.Value | default('?') }} left once it was done"
+          - "OK  no orphan revisions; the key cleanup did not run again after a restart"
+          - "OK  pruning resumed on the next write ({{ lg_sample_pruned_ids | length }} pruned docs back to {{ lg_pruned_keep }} revisions)"

@@ -1,0 +1,68 @@
+# scenarios/company-1/RKC5/vars.yml -- inputs for rkc5.yml (dataset 4: several databases running
+# the key cleanup at once on one server).  Every key can be overridden with -e.
+
+rkc5_node: "1a"
+rkc5_label: RKC5        # the graph page title (RKC10 runs this playbook as RKC10)
+
+# The databases written on 6.2 -- each gets the same shapes and runs its own key cleanup.
+rkc5_dbs: [db_kc1, db_kc2, db_kc3]
+
+# Created AFTER the upgrade (a new database: no key cleanup of its own).  It gets a steady trickle
+# of user writes from scripts/write_probe.py, so its write latency shows the effect of the other
+# databases' cleanups on a database that shares the server.
+rkc5_bystander_db: db_bystander
+rkc5_probe_interval_secs: 0.2
+
+# A second write probe on one of the databases BEING CLEANED (its writes share that db's single
+# write queue with the cleanup).  '' = off.  Its docs go to collection Probe, with revisions off
+# there, so the db's revision count is untouched; the doc-count check adds the Probe docs.
+#   -e rkc5_probe_cleaning_db=db_kc1   (RKC10 sets it)
+rkc5_probe_cleaning_db: ""
+
+# A cloud-like disk (rkc-common/io_cap.yml): from the upgrade on, the container's disk I/O is
+# capped at this many IOPS and MB/s (reads and writes each).  0 = no cap.  RKC10 sets 1500 / 100.
+rkc5_io_iops: 0
+rkc5_io_mbps: 0
+
+# Shapes: RKC3's (../RKC3/vars.yml) scaled down.  At rkc5_scale 0.025, per database:
+#   plain   1.27M docs x 4 revisions                         = 5.09M revisions
+#   pruned   125k docs written 6x, keep 3                     =  375k revisions + 375k tombstones
+#   att      125k docs x 4 revisions; 12.5k get an attachment =  512k revisions
+#                                                             = 1.52M docs + 5.98M revisions
+# x 3 databases = 4.6M docs + 18M revisions, ~2 GB on disk per database.  Seeding ~10 min.
+# On the laptop run with CONTAINER_MEMORY=10g (run.sh sets it) so the data stays in memory.
+# Bigger on kaiju: -e rkc5_scale=0.1 (24M revisions per database) or more.
+rkc5_scale: 0.025
+
+rkc5_default_keep: 1000000
+rkc5_pruned_keep: 3
+rkc5_tombstone_cleanup_interval_min: 100000   # tombstone cleaner timer off (see ../RKC2/vars.yml)
+
+rkc5_shapes:
+  - { name: plain,  prefix: lg/plain,  collection: Plain,  docs: 50900000, revs: 4, pad_bytes: 120 }
+  - { name: pruned, prefix: lg/pruned, collection: Pruned, docs: 5000000,  revs: 6, pad_bytes: 120 }
+  - { name: att,    prefix: lg/att,    collection: Att,    docs: 5000000,  revs: 4, pad_bytes: 120,
+      att_docs: 500000, att_every: 4, att_size: 256 }
+
+# Per database: this many docs per shape (spread over the id range, plus first and last) are
+# fingerprinted and have their attachments read back, before and after.  Totals are exact.
+rkc5_sample_per_shape: 50
+
+rkc5_loader_threads: 16
+rkc5_loader_batch: 1000
+
+# Measurement windows (seconds).  idle: right after the upgrade -- NOT idle: the server loads every
+# db at startup, so their cleanups are already running.  after: once every cleanup is done.
+rkc5_idle_secs: 120
+rkc5_after_secs: 60
+rkc5_sample_interval_secs: 2
+rkc5_size_interval_secs: 15    # data file + journal sizes (scripts/db_size.py)
+
+# Budgets.  The server loads each db at startup; a 6.2 db's load includes the storage schema
+# upgrade (offline meanwhile).  rkc5_load_timeout_secs = how long to wait for them to answer.
+rkc5_load_timeout_secs: 1800
+rkc5_cleanup_timeout_secs: 14400   # all cleanups, wall clock
+rkc5_orphan_check_budget_secs: 1800
+
+# Where the measurements and the report are written (on this machine).
+rkc5_out_dir: /tmp/rkc5

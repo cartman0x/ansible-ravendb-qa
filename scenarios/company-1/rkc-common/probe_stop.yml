@@ -1,0 +1,29 @@
+# scenarios/company-1/rkc-common/probe_stop.yml -- task file.
+# Stops the probe probe_start.yml started and summarizes its writes per window: writes, errors
+# (status not 201), p50 / p95 / p99 / max ms.  Sets the fact `probe_windows` ({window: {...}}).
+# Requires: probe_csv, probe_windows_spec (list of "NAME:START:END", epoch seconds), repo_root.
+
+- name: Stop the write probe
+  ansible.builtin.file:
+    path: "{{ probe_csv }}.stop"
+    state: touch
+    mode: "0644"
+
+- name: Wait for it to exit
+  ansible.builtin.async_status:
+    jid: "{{ _probe_job.ansible_job_id }}"
+  register: _probe_bg
+  until: _probe_bg.finished
+  retries: 60
+  delay: 2
+
+- name: Summarize the probe's writes per window
+  ansible.builtin.command:
+    argv: "{{ [ansible_playbook_python, repo_root ~ '/scripts/write_probe.py', 'summarize', '--csv', probe_csv]
+              + (probe_windows_spec | map('regex_replace', '^', '--window=') | list) }}"
+  register: _probe_sum
+  changed_when: false
+
+- name: Keep the window summary
+  ansible.builtin.set_fact:
+    probe_windows: "{{ _probe_sum.stdout | from_json }}"

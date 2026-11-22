@@ -1,0 +1,55 @@
+# scenarios/company-1/RKC8/after_upgrade.yml -- task file, run right after one node's upgrade.
+# Checks the node runs v_new and the writer is still alive, waits until the node's key cleanup has
+# started (first progress line -- or "is done" if it was quicker), and records when.  Then the
+# next node's upgrade starts at once, while this node's cleanup is still running.
+# Requires: rl_n (the node just upgraded), rl_next (the next node, or ''), plus the facts of
+# rkc8.yml's earlier plays.
+
+- name: Read the version of {{ rl_n }}
+  ansible.builtin.uri:
+    url: "https://{{ rl_n }}.{{ ravendb_domain }}:443/build/version"
+    client_cert: "{{ cert_dir }}/client.pem"
+    ca_path: "{{ cert_ca_crt }}"
+  register: _v
+  retries: 60
+  delay: 2
+  until: _v is succeeded
+
+- name: Assert {{ rl_n }} runs v_new
+  ansible.builtin.assert:
+    that: _v.json.FullVersion is not match('^6\.2\.')
+    fail_msg: "{{ rl_n }} still runs {{ _v.json.FullVersion }} -- the upgrade did not install custom_build"
+
+- name: The live writer is still running
+  ansible.builtin.async_status:
+    jid: "{{ _writer_job.ansible_job_id }}"
+  register: _w
+  failed_when: _w.finished | bool
+
+- name: Wait for the key cleanup to start on {{ rl_n }} (db loaded -- first progress line)
+  ansible.builtin.shell: |
+    end=$(( $(date +%s) + {{ rl_progress_timeout_secs | int }} ))
+    while [ $(date +%s) -lt $end ]; do
+      l=$(docker exec {{ rl_n }} sh -c "grep -rhF -- '{{ cleanup_any_pattern }}' {{ log_dir }} 2>/dev/null" | grep -F '|{{ rl_db }}|')
+      echo "$l" | grep -qF '{{ cleanup_done_pattern }}' && { echo DONE_ALREADY; exit 0; }
+      echo "$l" | grep -qF '{{ cleanup_progress_pattern }}' && { echo STARTED; exit 0; }
+      sleep 2
+    done
+    echo "no key-cleanup line for {{ rl_db }} on {{ rl_n }} within {{ rl_progress_timeout_secs }}s" >&2
+    exit 1
+  args:
+    executable: /bin/bash
+  register: _started
+  changed_when: false
+
+- name: Record the timeline
+  ansible.builtin.set_fact:
+    rl_timeline: >-
+      {{ rl_timeline | combine({rl_n: (rl_timeline[rl_n] | default({})) | combine({
+           'version': _v.json.FullVersion, 'cleanup_seen': lookup('pipe', 'date +%s') | int,
+           'cleanup_state_when_seen': _started.stdout | trim})})
+         | combine({rl_next: {'upgrade_start': lookup('pipe', 'date +%s') | int}} if rl_next else {}) }}
+
+- name: "{{ rl_n }} upgraded -- cleanup {{ _started.stdout | trim }}{{ ', upgrading ' ~ rl_next ~ ' now' if rl_next else '' }}"
+  ansible.builtin.debug:
+    msg: "{{ rl_timeline }}"

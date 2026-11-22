@@ -1,0 +1,15 @@
+# scenarios/company-1/rkc-common/count_cleanup_lines.yml -- task file.
+# Counts every cleanup log line on the node and sets `cleanup_line_count` (int).
+# Compare a count taken before a restart with one taken after to prove the cleanup did not
+# run again.  Requires: cleanup_node, plus rkc-common/vars.yml.
+
+- name: Count cleanup log lines on {{ cleanup_node }}
+  ansible.builtin.shell: >-
+    docker exec {{ cleanup_node }} sh -c
+    "grep -rhF -- '{{ cleanup_any_pattern }}' {{ log_dir }} 2>/dev/null | wc -l"
+  register: _cleanup_count
+  changed_when: false
+
+- name: Keep the count
+  ansible.builtin.set_fact:
+    cleanup_line_count: "{{ _cleanup_count.stdout | int }}"

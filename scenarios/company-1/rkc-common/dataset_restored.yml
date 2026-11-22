@@ -1,0 +1,40 @@
+# scenarios/company-1/rkc-common/dataset_restored.yml -- task file, run right after a
+# snapshot restore.  A snapshot is taken BY a periodic-backup task, so that task is part of the
+# database record the snapshot captures, and comes back (disabled) on every restore.  Even
+# disabled, it pins every tombstone for its next incremental backup (MinAllDocsEtag 0), so the
+# tombstone cleaner would delete nothing.
+# Deletes every backup task on the restored db and asserts no ongoing task is left.
+# Requires: dataset_node, dataset_db.
+
+- name: List ongoing tasks on the restored {{ dataset_db }}
+  ansible.builtin.uri:
+    url: "https://{{ dataset_node }}.{{ ravendb_domain }}:443/databases/{{ dataset_db }}/tasks"
+    client_cert: "{{ cert_dir }}/client.pem"
+    ca_path: "{{ cert_ca_crt }}"
+  register: _restored_tasks
+
+- name: Delete backup tasks inherited from the snapshot
+  ansible.builtin.uri:
+    url: >-
+      https://{{ dataset_node }}.{{ ravendb_domain }}:443/databases/{{ dataset_db }}/admin/tasks?id={{
+      item.TaskId }}&type=Backup&taskName={{ item.TaskName | urlencode }}
+    method: DELETE
+    client_cert: "{{ cert_dir }}/client.pem"
+    ca_path: "{{ cert_ca_crt }}"
+  loop: "{{ _restored_tasks.json.OngoingTasks | selectattr('TaskType', '==', 'Backup') | list }}"
+  loop_control: { label: "{{ item.TaskName }} (id {{ item.TaskId }})" }
+
+- name: List ongoing tasks again
+  ansible.builtin.uri:
+    url: "https://{{ dataset_node }}.{{ ravendb_domain }}:443/databases/{{ dataset_db }}/tasks"
+    client_cert: "{{ cert_dir }}/client.pem"
+    ca_path: "{{ cert_ca_crt }}"
+  register: _restored_tasks_after
+
+- name: Assert the restored db has no ongoing tasks (nothing pins tombstones)
+  ansible.builtin.assert:
+    that: _restored_tasks_after.json.OngoingTasks | length == 0
+    fail_msg: >-
+      ongoing tasks left on the restored db (they can pin tombstones):
+      {{ _restored_tasks_after.json.OngoingTasks | map(attribute='TaskType') | list }}
+          {{ _restored_tasks_after.json.OngoingTasks | map(attribute='TaskName') | list }}

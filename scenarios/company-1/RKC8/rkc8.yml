@@ -1,0 +1,639 @@
+##################################################################################################
+# scenarios/company-1/RKC8/rkc8.yml -- ROLLING UPGRADE UNDER LOAD: a 3-node 6.2 cluster is upgraded
+# one node at a time while users keep writing to the documents the key cleanup is walking.
+#
+# Why: a customer's cluster is upgraded node by node.  For a while, nodes with the cleanup running
+# replicate to and from nodes still on 6.2, and user writes go on.  Every node must end up with
+# the same, complete revisions -- none lost, none doubled, no conflicts.
+#
+# Flow: seed on 6.2 (on 1a, replicated to 1b and 1c), start the live writer, then upgrade 1a, 1b,
+# 1c in turn -- each as soon as the previous node's key cleanup has started.
+# Verify, on EVERY node:
+#   * the overlap really happened: 1a's cleanup was still running when 1b went down, and
+#     each node accepted writes to its own docs while its cleanup ran (else: bigger dataset);
+#   * the writer got no HTTP 500 (the bug's symptom) -- every status is listed;
+#   * docs not written: revisions identical to the 6.2 baseline;
+#   * written docs: seeded + accepted writes (+1 at most if a write's answer was lost);
+#   * all three nodes hold the SAME revisions for every checked doc;
+#   * totals: docs unchanged, revisions = baseline + accepted writes, revision tombstones
+#     unchanged per node, no conflicts, no orphan revisions, no key-cleanup error line.
+# CPU / memory is not sampled here (RKC3, RKC5, RKC7 do that); the writer's errors per window
+# and the cleanup timeline are in the report (rl_report_json).
+#
+# RUN (builds a fresh 1x3 lab on 6.2 first -- it TEARS DOWN the lab, see run.sh):
+#   scenarios/company-1/RKC8/run.sh 6.2.20 builds/raven-prNNN.deb
+# Docker mode only (log reads use `docker exec`).
+##################################################################################################
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/_internal/ensure_ravendb_venv.yml
+
+
+# ----- pre: validate inputs, compute ids and expectations -------------------------------------------
+
+- name: Rolling -- pre -- validate inputs and show plan
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - custom_build is defined
+          - custom_build is match('^https?://') or custom_build is file
+          - "'download' in ansible_skip_tags"
+          - target_mode | default('docker') == 'docker'
+          - rl_nodes == ['1a', '1b', '1c']
+          - rl_shapes | selectattr('name', 'equalto', rl_live_shape) | list | length == 1
+          - (rl_shapes | selectattr('name', 'equalto', rl_live_shape) | first).collection not in ['Pruned']
+          - rl_shapes | map(attribute='revs') | map('int') | max < rl_default_keep | int
+        fail_msg: >-
+          Required: -e custom_build=<path or URL to the v_new .deb> AND --skip-tags download.
+          Docker mode only; rl_nodes must stay [1a, 1b, 1c] (the upgrade plays name them);
+          rl_live_shape must name one shape, not the Pruned one (its count would depend on pruning).
+
+    - name: Compute ids and expected revision counts
+      ansible.builtin.set_fact:
+        repo_root: "{{ playbook_dir }}/../../.."
+        rl_base_url: "https://{{ rl_nodes[0] }}.{{ ravendb_domain }}:443"
+        rl_live: "{{ rl_shapes | selectattr('name', 'equalto', rl_live_shape) | first }}"
+        rl_expected: >-
+          {%- set out = {} -%}
+          {%- for s in rl_shapes -%}
+          {%- for n in range(s.docs | int) -%}
+          {%- set with_att = n < s.att_docs | default(0) | int and s.att_every | default(0) | int > 0 -%}
+          {%- set total = s.revs | int + ((s.revs | int // s.att_every | int) if with_att else 0) -%}
+          {%- set _ = out.update({s.prefix ~ '/' ~ n:
+                ([total, rl_pruned_keep | int] | min) if s.collection == 'Pruned' else total}) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Pick the written docs and the checked sample
+      ansible.builtin.set_fact:
+        # same order and home nodes as live_writer.py's doc_plan()
+        rl_written: >-
+          {%- set out = {} -%}
+          {%- for n in range(0, rl_live.docs | int, rl_live_every | int) -%}
+          {%- set _ = out.update({rl_live.prefix ~ '/' ~ n: rl_nodes[loop.index0 % (rl_nodes | length)]}) -%}
+          {%- endfor -%}
+          {{ out }}
+        rl_untouched: >-
+          {%- set out = [] -%}
+          {%- set d = rl_live.docs | int -%}
+          {%- set k = [rl_sample_plain | int, d] | min -%}
+          {%- for i in range(k) -%}
+          {%- set n = ((i * (d - 1)) // ([k - 1, 1] | max)) -%}
+          {%- set n = n + 1 if n % (rl_live_every | int) == 0 and n + 1 < d else n -%}
+          {%- if n % (rl_live_every | int) != 0 and (rl_live.prefix ~ '/' ~ n) not in out -%}
+          {%- set _ = out.append(rl_live.prefix ~ '/' ~ n) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- for s in rl_shapes if s.name != rl_live_shape -%}
+          {%- for n in range(s.docs | int) -%}
+          {%- set _ = out.append(s.prefix ~ '/' ~ n) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Keep the checked id list
+      ansible.builtin.set_fact:
+        rl_checked: "{{ rl_untouched + (rl_written.keys() | list) }}"
+
+    - name: Show plan
+      ansible.builtin.debug:
+        msg: >-
+          Plan -- rolling upgrade under load:  nodes={{ rl_nodes }}  db={{ rl_db }}
+          docs={{ rl_expected | length }}  revisions={{ rl_expected.values() | sum }}
+          written docs={{ rl_written | length }} (every {{ rl_live_every }}th {{ rl_live.prefix }})
+          checked docs per node={{ rl_checked | length }}  v_new={{ custom_build }}
+
+
+# ----- step 1: build the dataset on 6.2, on all three nodes ----------------------------------------
+
+- name: Rolling -- step 1 -- seed on 6.2 and record the baseline on every node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Stop a live writer left over from an earlier run (it would write into this lab)
+      ansible.builtin.shell: pkill -f '[l]ive_writer.py run' || true   # [l]: not this shell itself
+      changed_when: false
+
+    - name: Read the version of every node
+      ansible.builtin.uri:
+        url: "https://{{ item }}.{{ ravendb_domain }}:443/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      loop: "{{ rl_nodes }}"
+      register: _versions
+
+    - name: Assert every node is on 6.2
+      ansible.builtin.assert:
+        that: _versions.results | map(attribute='json.FullVersion') | reject('match', '^6\.2\.') | list | length == 0
+        fail_msg: "Expected 6.2 on every node, got {{ _versions.results | map(attribute='json.FullVersion') | list }}"
+
+    - name: Keep the 6.2 version
+      ansible.builtin.set_fact:
+        v_before: "{{ _versions.results[0].json.FullVersion }}"
+        rl_timeline: {}
+
+    - name: Create {{ rl_db }} on all three nodes, tombstone cleaner's timer off
+      ansible.builtin.uri:
+        url: "{{ rl_base_url }}/admin/databases?replicationFactor={{ rl_nodes | length }}"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body:
+          DatabaseName: "{{ rl_db }}"
+          Settings:
+            Tombstones.CleanupIntervalInMin: "{{ rl_tombstone_cleanup_interval_min | string }}"
+        status_code: [200, 201]
+
+    - name: Wait for {{ rl_db }} to come online on every node
+      ansible.builtin.uri:
+        url: "https://{{ item }}.{{ ravendb_domain }}:443/databases/{{ rl_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      loop: "{{ rl_nodes }}"
+      register: _online
+      retries: 60
+      delay: 2
+      until: _online is succeeded
+
+    - name: Configure revisions (Default keep {{ rl_default_keep }}, Pruned keep {{ rl_pruned_keep }})
+      ravendb_revisions:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ rl_nodes[0] }}"
+        db_name: "{{ rl_db }}"
+        default_keep: "{{ rl_default_keep | int }}"
+        default_max_age_secs: 0
+        collections_config: "{{ {'Pruned': {'keep': rl_pruned_keep | int, 'max_age_secs': 0}} }}"
+
+    - name: Seed shapes on {{ rl_nodes[0] }}
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ repo_root }}/scripts/revisions_loader.py"
+          - --target={{ rl_nodes[0] }}
+          - --domain={{ ravendb_domain }}
+          - --cert={{ cert_dir }}/client.pem
+          - --ca={{ cert_ca_crt }}
+          - --db={{ rl_db }}
+          - --collection={{ item.collection }}
+          - --id-prefix={{ item.prefix }}
+          - --docs={{ item.docs }}
+          - --revs={{ item.revs }}
+          - --att-docs={{ item.att_docs | default(0) }}
+          - --att-every={{ item.att_every | default(0) }}
+          - --att-size={{ item.att_size | default(4096) }}
+          - --pad-bytes={{ item.pad_bytes | default(0) }}
+          - --threads={{ rl_loader_threads }}
+          - --batch={{ rl_loader_batch }}
+      loop: "{{ rl_shapes }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _seed
+      changed_when: true
+
+    - name: Loader summary
+      ansible.builtin.debug:
+        msg: "{{ _seed.results | map(attribute='stdout_lines') | map('last') | list }}"
+
+    - name: Wait for 1b and 1c to catch up
+      ansible.builtin.include_tasks: ../rkc-common/wait_parity.yml
+      vars:
+        parity_nodes: "{{ rl_nodes }}"
+        parity_db: "{{ rl_db }}"
+        parity_fields: [CountOfDocuments, CountOfRevisionDocuments]
+        parity_timeout_secs: "{{ rl_parity_timeout_secs }}"
+
+    - name: Fingerprint the checked docs on every node (before; attachments read back)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ item }}"
+        db_name: "{{ rl_db }}"
+        ids: "{{ rl_checked }}"
+        verify_attachment_content: true
+      loop: "{{ rl_nodes }}"
+      register: _fp
+
+    - name: Keep the baseline
+      ansible.builtin.set_fact:
+        fp_before: "{{ _fp.results[0].fingerprints }}"
+        attachments_checked_before: "{{ _fp.results[0].attachments_checked }}"
+
+    - name: Assert the 6.2 baseline -- expected counts, and the same revisions on every node
+      ansible.builtin.assert:
+        that:
+          - _wrong | length == 0
+          - _differ | length == 0
+        fail_msg: >-
+          wrong counts on {{ rl_nodes[0] }} (first 20, got != expected): {{ _wrong[:20] }};
+          nodes that differ from {{ rl_nodes[0] }}: {{ _differ }}
+      vars:
+        _wrong: >-
+          {%- set out = [] -%}
+          {%- for k in rl_checked if fp_before[k].count != rl_expected[k] -%}
+          {%- set _ = out.append(k ~ ': ' ~ fp_before[k].count ~ ' != ' ~ rl_expected[k]) -%}
+          {%- endfor -%}
+          {{ out }}
+        _differ: >-
+          {%- set out = [] -%}
+          {%- for r in _fp.results[1:] -%}
+          {%- set n = namespace(c=0) -%}
+          {%- for k in rl_checked if r.fingerprints[k] != fp_before[k] -%}{%- set n.c = n.c + 1 -%}{%- endfor -%}
+          {%- if n.c -%}{%- set _ = out.append(r.item ~ ': ' ~ n.c ~ ' docs') -%}{%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Read /stats on every node (before)
+      ansible.builtin.uri:
+        url: "https://{{ item }}.{{ ravendb_domain }}:443/databases/{{ rl_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      loop: "{{ rl_nodes }}"
+      register: _stats
+
+    - name: Keep /stats per node
+      ansible.builtin.set_fact:
+        stats_before: "{{ dict(rl_nodes | zip(_stats.results | map(attribute='json'))) }}"
+
+    - name: Assert docs on every node, no conflicts
+      ansible.builtin.assert:
+        that:
+          - stats_before.values() | map(attribute='CountOfDocuments') | map('int') | unique | list == [rl_expected | length]
+          - stats_before.values() | map(attribute='CountOfConflicts') | map('int') | max == 0
+        fail_msg: >-
+          docs per node {{ stats_before.values() | map(attribute='CountOfDocuments') | list }} (expected
+          {{ rl_expected | length }}), conflicts {{ stats_before.values() | map(attribute='CountOfConflicts') | list }}
+
+    - name: Baseline summary
+      ansible.builtin.debug:
+        msg:
+          - "version          {{ v_before }} on {{ rl_nodes | join(', ') }}"
+          - "docs             {{ stats_before['1a'].CountOfDocuments }}"
+          - "revisions        {{ stats_before.values() | map(attribute='CountOfRevisionDocuments') | list }}"
+          - "tombstones       {{ stats_before.values() | map(attribute='CountOfTombstones') | list }}"
+          - "attachments      {{ attachments_checked_before }} read back per node, identical on all"
+
+    - name: Clear the writer files of an earlier run
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: [/tmp/rkc8-writer.csv, /tmp/rkc8-writer.stop]
+
+    - name: Start the live writer ({{ rl_written | length }} docs over {{ rl_nodes | join(', ') }})
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ repo_root }}/scripts/live_writer.py"
+          - run
+          - --nodes={{ rl_nodes | join(',') }}
+          - --db={{ rl_db }}
+          - --prefix={{ rl_live.prefix }}
+          - --collection={{ rl_live.collection }}
+          - --docs={{ rl_live.docs }}
+          - --every={{ rl_live_every }}
+          - --threads={{ rl_writer_threads }}
+          - --interval={{ rl_writer_interval_secs }}
+          - --out=/tmp/rkc8-writer.csv
+          - --stop-file=/tmp/rkc8-writer.stop
+          - --domain={{ ravendb_domain }}
+          - --cert={{ cert_dir }}/client.pem
+          - --ca={{ cert_ca_crt }}
+      async: "{{ (cleanup_timeout_secs | int) * 3 + 7200 }}"
+      poll: 0
+      register: _writer_job
+      changed_when: true
+
+    - name: Writes while every node is on 6.2 ({{ rl_writes_before_secs }}s)
+      ansible.builtin.pause:
+        seconds: "{{ rl_writes_before_secs | int }}"
+
+    - name: The rolling upgrade starts with {{ rl_nodes[0] }}
+      ansible.builtin.set_fact:
+        t_writer_start: "{{ lookup('pipe', 'date +%s') | int - (rl_writes_before_secs | int) }}"
+        rl_timeline: "{{ {'1a': {'upgrade_start': lookup('pipe', 'date +%s') | int}} }}"
+
+
+# ----- step 2: rolling upgrade, the writer keeps writing -------------------------------------------
+# A play's hosts are fixed before vars files load, hence the literal node names.
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  vars: { target: "1a" }
+
+- name: Rolling -- 1a upgraded, its cleanup running -> upgrade 1b
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - ansible.builtin.include_tasks: after_upgrade.yml
+      vars: { rl_n: "1a", rl_next: "1b" }
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  vars: { target: "1b" }
+
+- name: Rolling -- 1b upgraded, its cleanup running -> upgrade 1c
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - ansible.builtin.include_tasks: after_upgrade.yml
+      vars: { rl_n: "1b", rl_next: "1c" }
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  vars: { target: "1c" }
+
+- name: Rolling -- 1c upgraded
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - ansible.builtin.include_tasks: after_upgrade.yml
+      vars: { rl_n: "1c", rl_next: "" }
+
+
+# ----- step 3: all cleanups done, stop the writer, let replication catch up -------------------------
+
+- name: Rolling -- step 3 -- wait for every node's key cleanup, then stop the writer
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Wait for "{{ cleanup_done_pattern }}" on every node (live -- docker exec 1a sh -c 'tail -F {{ log_dir }}/* | grep --line-buffered "{{ cleanup_any_pattern }}"')
+      ansible.builtin.shell: |
+        end=$(( $(date +%s) + {{ cleanup_timeout_secs | int }} ))
+        while [ $(date +%s) -lt $end ]; do
+          docker exec {{ item }} sh -c "grep -rhF -- '{{ cleanup_done_pattern }}' {{ log_dir }} 2>/dev/null" \
+            | grep -qF '|{{ rl_db }}|' && exit 0
+          sleep 5
+        done
+        echo "no '{{ cleanup_done_pattern }}' for {{ rl_db }} on {{ item }} within {{ cleanup_timeout_secs }}s" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      loop: "{{ rl_nodes }}"
+      changed_when: false
+
+    - name: Writes after every cleanup is done ({{ rl_writes_after_secs }}s)
+      ansible.builtin.pause:
+        seconds: "{{ rl_writes_after_secs | int }}"
+
+    - name: Stop the live writer
+      ansible.builtin.file:
+        path: /tmp/rkc8-writer.stop
+        state: touch
+        mode: "0644"
+
+    - name: Wait for it to exit
+      ansible.builtin.async_status:
+        jid: "{{ _writer_job.ansible_job_id }}"
+      register: _writer
+      until: _writer.finished
+      retries: 60
+      delay: 2
+
+    - name: Key cleanup timeline per node (first progress line, "is done", error lines)
+      ansible.builtin.shell: |
+        for n in {{ rl_nodes | join(' ') }}; do
+          lines=$(docker exec $n sh -c "grep -rhiF -- '{{ cleanup_any_pattern }}' {{ log_dir }} 2>/dev/null" | grep -F '|{{ rl_db }}|' | LC_ALL=C sort)
+          ep() { [ -n "$1" ] && date -u -d "$1" +%s || echo null; }
+          first=$(printf '%s\n' "$lines" | grep -F '{{ cleanup_progress_pattern }}' | head -1 | cut -c1-19)
+          done_=$(printf '%s\n' "$lines" | grep -F '{{ cleanup_done_pattern }}' | head -1 | cut -c1-19)
+          errors=$(printf '%s\n' "$lines" | grep -ciF '{{ cleanup_error_pattern }}' || true)
+          echo "$n $(ep "$first") $(ep "$done_") ${errors:-0}"
+        done
+      args:
+        executable: /bin/bash
+      register: _tl
+      changed_when: false
+
+    - name: Keep the cleanup windows
+      ansible.builtin.set_fact:
+        rl_cleanup: >-
+          {%- set out = {} -%}
+          {%- for l in _tl.stdout_lines -%}
+          {%- set f = l.split() -%}
+          {%- set _ = out.update({f[0]: {'first': (f[1] | int) if f[1] != 'null' else none,
+                                         'done': (f[2] | int) if f[2] != 'null' else none,
+                                         'errors': f[3] | int}}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Summarize the writer per window
+      ansible.builtin.command:
+        argv: >-
+          {{ [ansible_playbook_python, repo_root ~ '/scripts/live_writer.py', 'summarize', '--csv', '/tmp/rkc8-writer.csv']
+             + (_windows | map('regex_replace', '^', '--window=') | list) }}
+      vars:
+        _windows: >-
+          {%- set out = [] -%}
+          {%- for n in rl_nodes -%}
+          {%- set c = rl_cleanup[n] -%}
+          {%- if c.first is not none -%}
+          {%- set _ = out.append('cleanup-' ~ n ~ ':' ~ c.first ~ ':' ~ (c.done if c.done is not none else 9999999999)) -%}
+          {%- endif -%}
+          {%- set _ = out.append('upgrade-' ~ n ~ ':' ~ rl_timeline[n].upgrade_start ~ ':' ~ rl_timeline[n].cleanup_seen) -%}
+          {%- endfor -%}
+          {{ out }}
+      register: _wsum
+      changed_when: false
+
+    - name: Keep the writer summary
+      ansible.builtin.set_fact:
+        rl_writer: "{{ _wsum.stdout | from_json }}"
+
+    - name: Writer totals
+      ansible.builtin.debug:
+        msg:
+          - "outcomes      {{ rl_writer.totals }}"
+          - "HTTP errors   {{ rl_writer.http_statuses }}"
+          - "per window    {{ rl_writer.windows }}"
+          - "cleanups      {{ rl_cleanup }}"
+          - "timeline      {{ rl_timeline }}"
+
+    - name: Wait for replication to catch up after the last write
+      ansible.builtin.include_tasks: ../rkc-common/wait_parity.yml
+      vars:
+        parity_nodes: "{{ rl_nodes }}"
+        parity_db: "{{ rl_db }}"
+        parity_fields: [CountOfDocuments, CountOfRevisionDocuments]
+        parity_timeout_secs: "{{ rl_parity_timeout_secs }}"
+
+
+# ----- step 4: verify on every node -----------------------------------------------------------------
+
+- name: Rolling -- step 4 -- verify every node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Assert the overlap happened (else the test proved little -- make the dataset bigger)
+      ansible.builtin.assert:
+        that: rl_cleanup['1a'].done is not none and rl_cleanup['1a'].done > rl_timeline['1b'].upgrade_start
+        fail_msg: >-
+          1a's cleanup ran {{ rl_cleanup['1a'] }}, 1b went down at {{ rl_timeline['1b'].upgrade_start }}:
+          1a must still be cleaning then.  Raise the plain shape's docs or revs (rl_shapes).
+
+    - name: Writes accepted on each node during its own cleanup
+      ansible.builtin.set_fact:
+        rl_writes_in_cleanup: >-
+          {%- set out = {} -%}
+          {%- for n in rl_nodes -%}
+          {%- set w = rl_writer.windows.get('cleanup-' ~ n, {}) -%}
+          {%- set _ = out.update({n: (w.get(n, {})).get('ok', 0)}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Assert each node accepted writes to its own docs while its cleanup ran
+      ansible.builtin.assert:
+        that: rl_writes_in_cleanup.values() | min > 0
+        fail_msg: "accepted writes during each node's own cleanup: {{ rl_writes_in_cleanup }} -- make the dataset bigger"
+
+    - name: Assert the writer got no server error (HTTP 5xx other than 503 while a node starts)
+      ansible.builtin.assert:
+        that: rl_writer.http_statuses.keys() | map('int') | select('ge', 500) | reject('eq', 503) | list | length == 0
+        fail_msg: "HTTP errors from the writer: {{ rl_writer.http_statuses }} -- details in /tmp/rkc8-writer.csv (outcome http_err)"
+
+    - name: Fingerprint the checked docs on every node (after)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ item }}"
+        db_name: "{{ rl_db }}"
+        ids: "{{ rl_checked }}"
+        verify_attachment_content: true
+      loop: "{{ rl_nodes }}"
+      register: _fpa
+
+    - name: Compare -- baseline, writes, and the nodes with each other
+      ansible.builtin.set_fact:
+        rl_check: >-
+          {%- set fa = _fpa.results[0].fingerprints -%}
+          {%- set changed = [] -%}
+          {%- for k in rl_untouched if fa[k] != fp_before[k] -%}
+          {%- set _ = changed.append(k ~ ': ' ~ fp_before[k].count ~ ' -> ' ~ fa[k].count) -%}
+          {%- endfor -%}
+          {%- set wrong = [] -%}
+          {%- set extra = namespace(n=0, ok=0) -%}
+          {%- for k, node in rl_written.items() -%}
+          {%- set w = rl_writer.docs.get(k, {'ok': 0, 'uncertain': false}) -%}
+          {%- set base = rl_expected[k] + w.ok -%}
+          {%- set extra.ok = extra.ok + w.ok -%}
+          {%- if fa[k].count == base -%}
+          {%- elif w.uncertain and fa[k].count == base + 1 -%}{%- set extra.n = extra.n + 1 -%}
+          {%- else -%}{%- set _ = wrong.append(k ~ ' (home ' ~ node ~ '): ' ~ fa[k].count ~ ' revisions, expected ' ~ base ~ (' or ' ~ (base + 1) if w.uncertain else '')) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set differ = {} -%}
+          {%- for r in _fpa.results[1:] -%}
+          {%- set ks = [] -%}
+          {%- for k in rl_checked if r.fingerprints[k] != fa[k] -%}{%- set _ = ks.append(k) -%}{%- endfor -%}
+          {%- if ks -%}{%- set _ = differ.update({r.item: ks[:20] ~ ' (' ~ ks | length ~ ' docs)'}) -%}{%- endif -%}
+          {%- endfor -%}
+          {{ {'changed': changed, 'wrong': wrong, 'differ': differ, 'accepted': extra.ok, 'uncertain_applied': extra.n,
+              'attachments': _fpa.results | map(attribute='attachments_checked') | list} }}
+
+    - name: Assert docs not written are unchanged on every node
+      ansible.builtin.assert:
+        that: rl_check.changed | length == 0
+        fail_msg: "{{ rl_check.changed | length }} untouched doc(s) changed on 1a (first 20, before -> after): {{ rl_check.changed[:20] }}"
+
+    - name: Assert written docs hold exactly the seeded + accepted revisions
+      ansible.builtin.assert:
+        that: rl_check.wrong | length == 0
+        fail_msg: "{{ rl_check.wrong | length }} written doc(s) with a wrong count on 1a (first 20): {{ rl_check.wrong[:20] }}"
+
+    - name: Assert all three nodes hold the same revisions
+      ansible.builtin.assert:
+        that:
+          - rl_check.differ | length == 0
+          - rl_check.attachments | unique | list == [attachments_checked_before | int]
+        fail_msg: "nodes that differ from 1a: {{ rl_check.differ }}; attachments read back per node: {{ rl_check.attachments }}"
+
+    - name: Read /stats on every node (after)
+      ansible.builtin.uri:
+        url: "https://{{ item }}.{{ ravendb_domain }}:443/databases/{{ rl_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      loop: "{{ rl_nodes }}"
+      register: _stats_after
+
+    - name: Assert totals on every node
+      ansible.builtin.assert:
+        that: _bad | length == 0
+        fail_msg: "{{ _bad }}"
+      vars:
+        _bad: >-
+          {%- set out = [] -%}
+          {%- for r in _stats_after.results -%}
+          {%- set b = stats_before[r.item] -%}
+          {%- set want_revs = (b.CountOfRevisionDocuments | int) + (rl_check.accepted | int) + (rl_check.uncertain_applied | int) -%}
+          {%- if r.json.CountOfDocuments | int != b.CountOfDocuments | int -%}
+          {%- set _ = out.append(r.item ~ ': docs ' ~ b.CountOfDocuments ~ ' -> ' ~ r.json.CountOfDocuments) -%}{%- endif -%}
+          {%- if r.json.CountOfRevisionDocuments | int != want_revs -%}
+          {%- set _ = out.append(r.item ~ ': revisions ' ~ r.json.CountOfRevisionDocuments ~ ', expected ' ~ want_revs ~
+                ' (' ~ b.CountOfRevisionDocuments ~ ' + ' ~ rl_check.accepted ~ ' accepted writes + ' ~ rl_check.uncertain_applied ~ ' unanswered but applied)') -%}{%- endif -%}
+          {%- if r.json.CountOfTombstones | int != b.CountOfTombstones | int -%}
+          {%- set _ = out.append(r.item ~ ': tombstones ' ~ b.CountOfTombstones ~ ' -> ' ~ r.json.CountOfTombstones) -%}{%- endif -%}
+          {%- if r.json.CountOfConflicts | int != 0 -%}
+          {%- set _ = out.append(r.item ~ ': ' ~ r.json.CountOfConflicts ~ ' conflicts') -%}{%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Assert no key-cleanup error line, and "is done" on every node
+      ansible.builtin.assert:
+        that:
+          - rl_cleanup.values() | map(attribute='errors') | sum == 0
+          - rl_cleanup.values() | map(attribute='done') | select('none') | list | length == 0
+        fail_msg: "key cleanup per node: {{ rl_cleanup }}"
+
+    - name: No orphan revisions on any node
+      ravendb_diagnostic:
+        kind: orphan_revisions
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        db_name: "{{ rl_db }}"
+        nodes: "{{ rl_nodes }}"
+        assert_mode: true
+
+    - name: Save the report -> {{ rl_report_json }}
+      ansible.builtin.copy:
+        dest: "{{ rl_report_json }}"
+        mode: "0644"
+        content: >-
+          {{ {'from': v_before, 'to': rl_timeline['1a'].version, 'nodes': rl_nodes, 'db': rl_db,
+              'dataset': {'docs': rl_expected | length, 'revisions': rl_expected.values() | sum,
+                          'written_docs': rl_written | length},
+              'timeline': rl_timeline, 'cleanup': rl_cleanup,
+              'writer': {'totals': rl_writer.totals, 'http_statuses': rl_writer.http_statuses,
+                         'windows': rl_writer.windows, 'accepted': rl_check.accepted,
+                         'unanswered_but_applied': rl_check.uncertain_applied},
+              'stats_before': stats_before,
+              'stats_after': dict(rl_nodes | zip(_stats_after.results | map(attribute='json')))} | to_nice_json }}
+
+    - name: "RESULT: rolling upgrade under load -- PASSED"
+      ansible.builtin.debug:
+        msg:
+          - "PASSED: rolling upgrade of {{ rl_nodes | join(', ') }} {{ v_before }} -> {{ rl_timeline['1a'].version }} while users kept writing"
+          - "Dataset:  {{ rl_expected | length }} docs, {{ stats_before['1a'].CountOfRevisionDocuments }} revisions, {{ stats_before['1a'].CountOfTombstones }} tombstones on 1a"
+          - "OK  the cleanups overlapped the rolling upgrade (1a cleaned {{ ((rl_cleanup['1a'].done - rl_cleanup['1a'].first) / 60) | round(1) }} min, still running when 1b went down)"
+          - "OK  {{ rl_check.accepted }} writes accepted ({{ rl_writes_in_cleanup }} on each node during its own cleanup); outcomes {{ rl_writer.totals }}; HTTP errors {{ rl_writer.http_statuses }}"
+          - "OK  written docs hold exactly their seeded + accepted revisions; docs not written are unchanged"
+          - "OK  all three nodes hold identical revisions for {{ rl_checked | length }} checked docs; {{ attachments_checked_before }} attachments read back on each"
+          - "OK  totals per node: docs unchanged, revisions = baseline + writes, tombstones unchanged, no conflicts, no orphans, no cleanup error"
+          - "Report: {{ rl_report_json }}"

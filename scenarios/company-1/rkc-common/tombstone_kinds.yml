@@ -1,0 +1,37 @@
+# scenarios/company-1/rkc-common/tombstone_kinds.yml -- task file.
+# Counts a database's tombstones BY KIND, from the storage tables (/stats only has the total):
+#   revisions    the Revisions.Tombstones table -- what the key cleanup must keep until it is done
+#   attachments  the Attachments.Tombstones table
+#   documents    every Collection.Tombstones.<collection> table
+#   total        the three together
+# While the key cleanup runs, only REVISION tombstones are kept; the tombstone
+# cleaner may delete the other kinds.
+# Requires: tk_node, tk_db.  Sets: tombstone_kinds.
+
+- name: Tombstones by kind on {{ tk_node }} ({{ tk_db }})
+  ansible.builtin.uri:
+    url: >-
+      https://{{ tk_node }}.{{ ravendb_domain }}:443/databases/{{ tk_db }}/debug/storage/environment/report?name={{
+      tk_db | urlencode }}&type=Documents&details=false
+    client_cert: "{{ cert_dir }}/client.pem"
+    ca_path: "{{ cert_ca_crt }}"
+    timeout: 600
+  register: _tk_report
+  # the report takes the db's write lock for a moment; under heavy writes the server gives up after
+  # 30 s (TimeoutException, HTTP 500) -- try again
+  retries: 10
+  delay: 15
+  until: _tk_report is succeeded
+
+- name: Keep the counts
+  ansible.builtin.set_fact:
+    tombstone_kinds: >-
+      {%- set tables = _tk_report.json.Report.Tables | default([]) -%}
+      {%- set n = namespace(rev=0, att=0, doc=0) -%}
+      {%- for t in tables -%}
+      {%- if t.Name == 'Revisions.Tombstones' -%}{%- set n.rev = n.rev + t.NumberOfEntries | int -%}
+      {%- elif t.Name == 'Attachments.Tombstones' -%}{%- set n.att = n.att + t.NumberOfEntries | int -%}
+      {%- elif t.Name.startswith('Collection.Tombstones.') -%}{%- set n.doc = n.doc + t.NumberOfEntries | int -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ {'revisions': n.rev, 'attachments': n.att, 'documents': n.doc, 'total': n.rev + n.att + n.doc} }}

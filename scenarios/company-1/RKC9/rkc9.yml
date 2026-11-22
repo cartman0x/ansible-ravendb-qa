@@ -1,0 +1,620 @@
+##################################################################################################
+# scenarios/company-1/RKC9/rkc9.yml -- the DISK FILLS UP in the middle of the revisions key
+# cleanup.  6.2 -> v_new, ONE node, small dataset (minutes).
+#
+# Why: the cleanup rewrites every revision row, so a database grows while it runs.  A customer
+# whose disk is nearly full can run out half way.  The database must fail cleanly (the server
+# stays up, nothing is half-written), and once space is freed and the server restarted the
+# cleanup must finish with every revision intact.
+#
+# Setup: db_full gets its own small filesystem (an ext4 image loop-mounted inside the container at
+# df_mount, its DataDir there), so only this db runs out of space.  Once the cleanup has logged
+# df_fill_after_lines progress lines, fill_trigger.sh fills it until df_reserve_mb is left.  If the
+# cleanup finishes before the db hits the full disk, the test FAILS -- it tested nothing.
+# Checks: the server keeps answering while the disk is full; after freeing space and a restart the
+# cleanup logs "is done" with no new error line; every doc's revisions, attachments and the
+# tombstones unchanged (docs +1 if the write attempted while full was accepted); no orphan
+# revisions; the cleanup does not run again after a further restart.
+#
+# RUN (builds a fresh 1-node lab on 6.2 first -- it TEARS DOWN the lab, see run.sh):
+#   scenarios/company-1/RKC9/run.sh 6.2.20 builds/raven-prNNN.deb
+# Docker mode only (the loop filesystem, log reads and the trigger use `docker exec`).
+##################################################################################################
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/_internal/ensure_ravendb_venv.yml
+
+
+# ----- pre: validate inputs, compute ids and expectations -------------------------------------------
+
+- name: Disk full -- pre -- validate inputs and show plan
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - custom_build is defined
+          - custom_build is match('^https?://') or custom_build is file
+          - "'download' in ansible_skip_tags"
+          - target_mode | default('docker') == 'docker'
+          - df_shapes | map(attribute='revs') | map('int') | max < df_default_keep | int
+        fail_msg: >-
+          Required: -e custom_build=<path or URL to the v_new .deb> AND --skip-tags download.
+          Docker mode only.  df_default_keep must exceed every shape's revs.
+
+    - name: Compute ids and expected revision counts
+      ansible.builtin.set_fact:
+        base_url: "https://{{ df_node }}.{{ ravendb_domain }}:443"
+        repo_root: "{{ playbook_dir }}/../../.."
+        df_expected: >-
+          {%- set out = {} -%}
+          {%- for s in df_shapes -%}
+          {%- for n in range(s.docs | int) -%}
+          {%- set with_att = n < s.att_docs | default(0) | int and s.att_every | default(0) | int > 0 -%}
+          {%- set total = s.revs | int + ((s.revs | int // s.att_every | int) if with_att else 0) -%}
+          {%- set _ = out.update({s.prefix ~ '/' ~ n:
+                ([total, df_pruned_keep | int] | min) if s.collection == 'Pruned' else total}) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+        df_min_revision_tombstones: >-
+          {%- set acc = [] -%}
+          {%- for s in df_shapes if s.collection == 'Pruned' -%}
+          {%- for n in range(s.docs | int) -%}
+          {%- set with_att = n < s.att_docs | default(0) | int and s.att_every | default(0) | int > 0 -%}
+          {%- set total = s.revs | int + ((s.revs | int // s.att_every | int) if with_att else 0) -%}
+          {%- set _ = acc.append([total - df_pruned_keep | int, 0] | max) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ acc | sum }}
+        # the "out of space" lines of the server log (Voron / .NET wording)
+        df_full_regex: "DiskFull|No space left on device|not enough (free )?(disk )?space|out of disk space"
+
+    - name: Keep the id list
+      ansible.builtin.set_fact:
+        df_all_ids: "{{ df_expected.keys() | list }}"
+
+    - name: Show plan
+      ansible.builtin.debug:
+        msg: >-
+          Plan -- disk full mid-cleanup:  node={{ df_node }}  db={{ df_db }} on a {{ df_fs_size_gb }} GB
+          filesystem at {{ df_mount }}  docs={{ df_all_ids | length }}  revisions={{ df_expected.values() | sum }}
+          min revision tombstones={{ df_min_revision_tombstones }}  fill after {{ df_fill_after_lines }}
+          progress lines, leaving {{ df_reserve_mb }} MB  v_new={{ custom_build }}
+
+
+# ----- step 1: small filesystem, seed on 6.2, baseline -----------------------------------------------
+
+- name: Disk full -- step 1 -- the db on its own small filesystem, seed on 6.2, baseline
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Read server version
+      ansible.builtin.uri:
+        url: "{{ base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_before
+
+    - name: Assert the node is on 6.2
+      ansible.builtin.assert:
+        that: v_before.json.FullVersion is match('^6\.2\.')
+        fail_msg: "Expected a 6.2 node, got {{ v_before.json.FullVersion }} -- install with -e rdb_version=6.2.x"
+
+    - name: Make a {{ df_fs_size_gb }} GB ext4 filesystem and mount it at {{ df_mount }} (inside {{ df_node }})
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ df_node }}"
+          - bash
+          - -c
+          - |
+            set -e
+            M={{ df_mount }}; IMG={{ df_image }}
+            if mountpoint -q "$M"; then umount "$M"; fi
+            rm -f "$IMG"; truncate -s {{ df_fs_size_gb }}G "$IMG"
+            mkfs.ext4 -q -F -m 0 "$IMG"            # -m 0: no blocks reserved for root
+            mkdir -p "$M"; mount -o loop "$IMG" "$M"; rmdir "$M/lost+found"
+            chown ravendb:ravendb "$M"; chmod 770 "$M"
+            findmnt -n -o SOURCE,FSTYPE,SIZE,AVAIL "$M"
+      register: _fs
+      changed_when: true
+
+    - name: Filesystem
+      ansible.builtin.debug:
+        msg: "{{ _fs.stdout }}"
+
+    - name: Create {{ df_db }} with its DataDir on the small filesystem, tombstone cleaner's timer off
+      ansible.builtin.uri:
+        url: "{{ base_url }}/admin/databases?replicationFactor=1"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body:
+          DatabaseName: "{{ df_db }}"
+          Settings:
+            DataDir: "{{ df_mount }}/{{ df_db }}"
+            Tombstones.CleanupIntervalInMin: "{{ df_tombstone_cleanup_interval_min | string }}"
+        status_code: [200, 201]
+
+    - name: Wait for {{ df_db }} to come online
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ df_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _online
+      retries: 30
+      delay: 2
+      until: _online is succeeded
+
+    - name: Assert the db's files are on the small filesystem
+      ansible.builtin.command: docker exec {{ df_node }} test -e {{ df_mount }}/{{ df_db }}/Raven.voron
+      changed_when: false
+
+    - name: Configure revisions (Default keep {{ df_default_keep }}, Pruned keep {{ df_pruned_keep }})
+      ravendb_revisions:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ df_node }}"
+        db_name: "{{ df_db }}"
+        default_keep: "{{ df_default_keep | int }}"
+        default_max_age_secs: 0
+        collections_config: "{{ {'Pruned': {'keep': df_pruned_keep | int, 'max_age_secs': 0}} }}"
+
+    - name: Seed shapes
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ repo_root }}/scripts/revisions_loader.py"
+          - --target={{ df_node }}
+          - --domain={{ ravendb_domain }}
+          - --cert={{ cert_dir }}/client.pem
+          - --ca={{ cert_ca_crt }}
+          - --db={{ df_db }}
+          - --collection={{ item.collection }}
+          - --id-prefix={{ item.prefix }}
+          - --docs={{ item.docs }}
+          - --revs={{ item.revs }}
+          - --att-docs={{ item.att_docs | default(0) }}
+          - --att-every={{ item.att_every | default(0) }}
+          - --att-size={{ item.att_size | default(4096) }}
+          - --pad-bytes={{ item.pad_bytes | default(0) }}
+          - --threads={{ df_loader_threads }}
+          - --batch={{ df_loader_batch }}
+      loop: "{{ df_shapes }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _seed
+      changed_when: true
+
+    - name: Loader summary
+      ansible.builtin.debug:
+        msg: "{{ _seed.results | map(attribute='stdout_lines') | map('last') | list }}"
+
+    - name: Space used on the small filesystem after the seed
+      ansible.builtin.command: docker exec {{ df_node }} df --output=pcent,used,avail -B1M {{ df_mount }}
+      register: _df_seed
+      changed_when: false
+
+    - name: Assert the dataset left room (it must not have been squeezed already)
+      ansible.builtin.assert:
+        that: (_df_seed.stdout_lines[1].split()[0] | replace('%', '') | int) <= df_max_used_pct_after_seed | int
+        fail_msg: "{{ _df_seed.stdout }} -- raise df_fs_size_gb"
+
+    - name: Fingerprint every doc's revisions and read every attachment back (before)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ df_node }}"
+        db_name: "{{ df_db }}"
+        ids: "{{ df_all_ids }}"
+        verify_attachment_content: true
+      register: _fp
+
+    - name: Keep the before fingerprints
+      ansible.builtin.set_fact:
+        fp_before: "{{ _fp.fingerprints }}"
+        attachments_checked_before: "{{ _fp.attachments_checked }}"
+
+    - name: Assert exact revision count per doc on 6.2
+      ansible.builtin.assert:
+        that: _wrong | length == 0
+        fail_msg: "{{ _wrong | length }} doc(s) with an unexpected revision count (first 20, got != expected): {{ _wrong[:20] }}"
+      vars:
+        _wrong: >-
+          {%- set out = [] -%}
+          {%- for k, v in df_expected.items() if fp_before[k].count != v -%}
+          {%- set _ = out.append(k ~ ': ' ~ fp_before[k].count ~ ' != ' ~ v) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Read /stats (before)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ df_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_before
+
+    - name: Assert doc count and that the revision tombstones are still there
+      ansible.builtin.assert:
+        that:
+          - stats_before.json.CountOfDocuments | int == df_all_ids | length
+          - stats_before.json.CountOfTombstones | int >= df_min_revision_tombstones | int
+        fail_msg: >-
+          docs {{ stats_before.json.CountOfDocuments }} (expected {{ df_all_ids | length }}),
+          tombstones {{ stats_before.json.CountOfTombstones }} (expected >= {{ df_min_revision_tombstones }})
+
+    - name: Baseline summary
+      ansible.builtin.debug:
+        msg:
+          - "version          {{ v_before.json.FullVersion }}"
+          - "docs             {{ stats_before.json.CountOfDocuments }}"
+          - "revision docs    {{ stats_before.json.CountOfRevisionDocuments }}"
+          - "tombstones       {{ stats_before.json.CountOfTombstones }}"
+          - "attachments      {{ stats_before.json.CountOfAttachments }} refs, {{ attachments_checked_before }} read back"
+          - "filesystem       {{ _df_seed.stdout_lines | join(' | ') }}"
+
+
+# ----- step 2: upgrade to v_new -------------------------------------------------------------------
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  vars:
+    # Play-level `hosts:` there is templated from `target` before vars files load; keep the
+    # default in sync with df_node in vars.yml.
+    target: "{{ df_node | default('1a') }}"
+
+
+# ----- step 3: fill the disk in the middle of the cleanup -------------------------------------------
+
+- name: Disk full -- step 3 -- the disk fills up in the middle of the key cleanup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  vars:
+    df_lines_cmd: >-
+      docker exec {{ df_node }} sh -c
+      "grep -rhiF -- '{{ cleanup_any_pattern }}' {{ log_dir }} 2>/dev/null | grep -F '|{{ df_db }}|' | LC_ALL=C sort"
+  tasks:
+    - name: Read server version (after upgrade)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_after
+      retries: 30
+      delay: 2
+      until: v_after is succeeded
+
+    - name: Assert the version changed
+      ansible.builtin.assert:
+        that: v_after.json.FullVersion != v_before.json.FullVersion
+        fail_msg: "still on {{ v_after.json.FullVersion }} -- the upgrade did not install custom_build"
+
+    # Not `docker cp` into /tmp: systemd mounts a tmpfs on the container's /tmp (see RKC6).
+    - name: Copy the fill trigger into {{ df_node }}
+      ansible.builtin.shell: >-
+        docker exec -i {{ df_node }} sh -c 'cat > /root/rkc9_fill_trigger.sh'
+        < {{ playbook_dir }}/fill_trigger.sh
+        && docker exec {{ df_node }} test -s /root/rkc9_fill_trigger.sh
+      changed_when: false
+
+    - name: Fill the disk after {{ df_fill_after_lines }} progress lines (waits up to {{ df_full_timeout_secs }}s)
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ df_node }}", sh, /root/rkc9_fill_trigger.sh, "{{ df_db }}", "{{ log_dir }}",
+               "{{ df_mount }}", "{{ df_fill_after_lines | string }}", "{{ df_reserve_mb | string }}",
+               "{{ df_full_timeout_secs | string }}"]
+      register: _fill
+      changed_when: true
+
+    - name: Assert the disk was filled in the middle of the cleanup
+      ansible.builtin.assert:
+        that: _fill.stdout is match('^FILLED ')
+        fail_msg: >-
+          fill trigger: {{ _fill.stdout }} -- MISSED = the cleanup was done before
+          {{ df_fill_after_lines }} progress lines (lower df_fill_after_lines or grow the dataset);
+          TIMEOUT = no progress lines (did the db load?).
+
+    - name: Wait for the db to hit the full disk (a "no space" line, or a key-cleanup error)
+      ansible.builtin.shell: |
+        end=$(( $(date +%s) + {{ df_full_timeout_secs | int }} ))
+        while [ $(date +%s) -lt $end ]; do
+          full=$(docker exec {{ df_node }} sh -c "grep -rhiE -- '{{ df_full_regex }}' {{ log_dir }} 2>/dev/null" | LC_ALL=C sort | head -3)
+          err=$({{ df_lines_cmd }} | grep -iF '{{ cleanup_error_pattern }}' | head -3)
+          done_=$({{ df_lines_cmd }} | grep -F '{{ cleanup_done_pattern }}' | head -1)
+          if [ -n "$full$err" ]; then
+            echo "HIT"; echo "--- no-space lines:"; echo "$full" | cut -c1-400
+            echo "--- cleanup error lines:"; echo "$err" | cut -c1-400; exit 0
+          fi
+          if [ -n "$done_" ]; then echo "DONE_FIRST"; echo "$done_" | cut -c1-300; exit 0; fi
+          sleep 2
+        done
+        echo "TIMEOUT"
+      args:
+        executable: /bin/bash
+      register: _hit
+      changed_when: false
+
+    - name: What the server logged
+      ansible.builtin.debug:
+        msg: "{{ _hit.stdout_lines }}"
+
+    - name: Assert the database ran into the full disk
+      ansible.builtin.assert:
+        that: _hit.stdout_lines[0] == 'HIT'
+        fail_msg: >-
+          {{ _hit.stdout_lines[0] }}: the key cleanup {{ 'finished without running out of space' if _hit.stdout_lines[0] == 'DONE_FIRST'
+          else 'logged nothing about the disk within ' ~ df_full_timeout_secs ~ 's' }} -- the test proved
+          nothing.  Lower df_reserve_mb / df_fill_after_lines, or grow the plain shape.
+
+    - name: Keep the full disk for {{ df_full_hold_secs }}s
+      ansible.builtin.pause:
+        seconds: "{{ df_full_hold_secs | int }}"
+
+    - name: The server still answers
+      ansible.builtin.uri:
+        url: "{{ base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 30
+      register: _alive
+
+    - name: How the db answers while the disk is full (reported, not asserted)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ df_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 60
+        status_code: [-1, 200, 500, 503]
+      register: _full_stats
+
+    - name: A user write while the disk is full (reported, not asserted)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ df_db }}/docs?id=rkc9-probe/while-full"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body: { v: 1, "@metadata": { "@collection": "Probe" } }
+        timeout: 60
+        status_code: [-1, 201, 500, 503, 507]
+      register: _full_write
+
+    - name: Key-cleanup lines while the disk is full
+      ansible.builtin.shell: "{{ df_lines_cmd }} | tail -5 | cut -c1-300"
+      register: _lines_full
+      changed_when: false
+
+    - name: Count the error lines so far
+      ansible.builtin.shell: "{{ df_lines_cmd }} | grep -ciF '{{ cleanup_error_pattern }}' || true"
+      register: _errors_while_full
+      changed_when: false
+
+    - name: Keep what happened while the disk was full
+      ansible.builtin.set_fact:
+        df_while_full:
+          fill: "{{ _fill.stdout }}"
+          logged: "{{ _hit.stdout_lines[1:] }}"
+          server_version_status: "{{ _alive.status }}"
+          db_stats_status: "{{ _full_stats.status }}"
+          db_stats_error: "{{ (_full_stats.json | default({})).Message | default(_full_stats.msg | default('')) | truncate(300) }}"
+          write_status: "{{ _full_write.status }}"
+          write_error: "{{ (_full_write.json | default({})).Message | default(_full_write.msg | default('')) | truncate(300) }}"
+          cleanup_error_lines: "{{ _errors_while_full.stdout | int }}"
+          last_cleanup_lines: "{{ _lines_full.stdout_lines }}"
+
+    - name: While the disk was full
+      ansible.builtin.debug:
+        msg: "{{ df_while_full }}"
+
+    - name: Free the space
+      ansible.builtin.command: docker exec {{ df_node }} sh -c 'rm -f {{ df_mount }}/filler && df -h {{ df_mount }} | tail -1'
+      register: _freed
+      changed_when: true
+
+
+# ----- step 4: restart, the cleanup must finish -------------------------------------------------------
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/restart_ravendb.yml
+  vars:
+    target: "{{ df_node | default('1a') }}"
+
+- name: Disk full -- step 4 -- after freeing the space and a restart, the cleanup must finish
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  vars:
+    df_lines_cmd: >-
+      docker exec {{ df_node }} sh -c
+      "grep -rhiF -- '{{ cleanup_any_pattern }}' {{ log_dir }} 2>/dev/null | grep -F '|{{ df_db }}|' | LC_ALL=C sort"
+  tasks:
+    - name: Load {{ df_db }} again
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ df_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _reload
+      retries: 120
+      delay: 5
+      until: _reload is succeeded
+
+    - name: Wait for "{{ cleanup_done_pattern }}" for {{ df_db }}
+      ansible.builtin.shell: |
+        end=$(( $(date +%s) + {{ cleanup_timeout_secs | int }} ))
+        while [ $(date +%s) -lt $end ]; do
+          {{ df_lines_cmd }} | grep -qF '{{ cleanup_done_pattern }}' && exit 0
+          sleep 5
+        done
+        echo "no '{{ cleanup_done_pattern }}' for {{ df_db }} within {{ cleanup_timeout_secs }}s after freeing the space" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Count the error lines now
+      ansible.builtin.shell: "{{ df_lines_cmd }} | grep -ciF '{{ cleanup_error_pattern }}' || true"
+      register: _errors_after
+      changed_when: false
+
+    - name: Assert no new key-cleanup error after the space was freed
+      ansible.builtin.assert:
+        that: _errors_after.stdout | int == df_while_full.cleanup_error_lines | int
+        fail_msg: "{{ df_while_full.cleanup_error_lines }} error line(s) while full, {{ _errors_after.stdout }} now -- see {{ log_dir }} on {{ df_node }}"
+
+    - name: Fingerprint every doc's revisions and read every attachment back (after)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ df_node }}"
+        db_name: "{{ df_db }}"
+        ids: "{{ df_all_ids }}"
+        verify_attachment_content: true
+      register: _fp_after
+
+    - name: Assert every doc's revisions unchanged
+      ansible.builtin.assert:
+        that: _diff | length == 0
+        fail_msg: "{{ _diff | length }} doc(s) changed (first 20, before -> after): {{ _diff[:20] }}"
+      vars:
+        _diff: >-
+          {%- set out = [] -%}
+          {%- for k, v in fp_before.items() if _fp_after.fingerprints[k] != v -%}
+          {%- set _ = out.append(k ~ ': ' ~ v.count ~ ' -> ' ~ _fp_after.fingerprints[k].count ~
+                ('' if v.count != _fp_after.fingerprints[k].count else ' (same count, content/attachments differ)')) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Assert every attachment was read back again
+      ansible.builtin.assert:
+        that: _fp_after.attachments_checked | int == attachments_checked_before | int
+        fail_msg: "read back {{ _fp_after.attachments_checked }} attachments, expected {{ attachments_checked_before }}"
+
+    - name: Read /stats (after the key cleanup)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ df_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_after
+
+    - name: Assert docs (+ the write while full, if accepted) and tombstones unchanged
+      ansible.builtin.assert:
+        that:
+          - stats_after.json.CountOfDocuments | int == (stats_before.json.CountOfDocuments | int) + (_probe | int)
+          - stats_after.json.CountOfTombstones | int == stats_before.json.CountOfTombstones | int
+        fail_msg: >-
+          docs {{ stats_before.json.CountOfDocuments }} -> {{ stats_after.json.CountOfDocuments }}
+          (+{{ _probe }} expected: the write while full answered {{ df_while_full.write_status }}), tombstones
+          {{ stats_before.json.CountOfTombstones }} -> {{ stats_after.json.CountOfTombstones }}
+      vars:
+        _probe: "{{ 1 if df_while_full.write_status | int == 201 else 0 }}"
+
+    - name: No orphan revisions
+      ravendb_diagnostic:
+        kind: orphan_revisions
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        db_name: "{{ df_db }}"
+        nodes: ["{{ df_node }}"]
+        assert_mode: true
+
+    - name: Run the tombstone cleaner by hand (key cleanup is done -- it may delete everything now)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ df_db }}/admin/tombstones/cleanup"
+        method: POST
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _cleaner
+
+    - name: Read /stats (after the tombstone cleaner)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ df_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_cleaned
+
+    - name: Assert the tombstone cleaner deleted every tombstone
+      ansible.builtin.assert:
+        that:
+          - stats_cleaned.json.CountOfTombstones | int == 0
+          - _cleaner.json.Value | int == stats_after.json.CountOfTombstones | int
+        fail_msg: >-
+          tombstone cleaner deleted {{ _cleaner.json.Value }} of {{ stats_after.json.CountOfTombstones }},
+          {{ stats_cleaned.json.CountOfTombstones }} left
+
+    - name: Count key-cleanup log lines before the final restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ df_node }}"
+
+    - name: Keep the count from before the final restart
+      ansible.builtin.set_fact:
+        lines_before_restart: "{{ cleanup_line_count }}"
+
+
+# ----- step 5: restart after it is done, the key cleanup must not run again -------------------------
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/restart_ravendb.yml
+  vars:
+    target: "{{ df_node | default('1a') }}"
+
+- name: Disk full -- step 5 -- the key cleanup must not run again after it is done
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Load {{ df_db }} again
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ df_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _reload2
+      retries: 60
+      delay: 2
+      until: _reload2 is succeeded
+
+    - name: Watch the log for {{ rerun_quiet_secs }}s
+      ansible.builtin.pause:
+        seconds: "{{ rerun_quiet_secs | int }}"
+
+    - name: Count key-cleanup log lines after the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ df_node }}"
+
+    - name: Assert no new key-cleanup lines
+      ansible.builtin.assert:
+        that: cleanup_line_count | int == lines_before_restart | int
+        fail_msg: "key cleanup ran again after restart: {{ lines_before_restart }} -> {{ cleanup_line_count }} cleanup log lines"
+
+    - name: Save the report -> {{ df_report_json }}
+      ansible.builtin.copy:
+        dest: "{{ df_report_json }}"
+        mode: "0644"
+        content: >-
+          {{ {'from': v_before.json.FullVersion, 'to': v_after.json.FullVersion, 'db': df_db,
+              'filesystem_gb': df_fs_size_gb, 'while_full': df_while_full,
+              'stats_before': stats_before.json, 'stats_after': stats_after.json} | to_nice_json }}
+
+    - name: "RESULT: disk full in the middle of the key cleanup -- PASSED"
+      ansible.builtin.debug:
+        msg:
+          - "PASSED: the disk filled up in the middle of the revisions key cleanup, {{ v_before.json.FullVersion }} -> {{ v_after.json.FullVersion }}"
+          - "Dataset:  {{ df_all_ids | length }} docs, {{ stats_before.json.CountOfRevisionDocuments }} revisions, {{ stats_before.json.CountOfTombstones }} tombstones, {{ attachments_checked_before }} attachments"
+          - "OK  the db hit the full disk: {{ df_while_full.logged | reject('match', '^---') | select | first | default('') | truncate(200) }}"
+          - "OK  the server kept answering; while full the db answered {{ df_while_full.db_stats_status }}, a write {{ df_while_full.write_status }}"
+          - "OK  space freed + restart: the db loaded and the cleanup finished, no new error line"
+          - "OK  every doc's revisions unchanged; all {{ attachments_checked_before }} attachments read back; tombstones unchanged, then all deleted by the cleaner"
+          - "OK  no orphan revisions; the cleanup did not run again after a restart once done"
+          - "Report: {{ df_report_json }}"
