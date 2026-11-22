@@ -1,0 +1,46 @@
+# scenarios/company-1/rkc-common/io_cap.yml -- task file.
+# Caps a running container's disk I/O like a cloud disk (e.g. AWS gp3 at 1500 IOPS / 100 MB/s):
+# writes the limits into the container's cgroup (io.max) on the disk that holds Docker's storage.
+# Takes effect at once and lasts until the container is removed (a RavenDB restart or upgrade
+# inside the container keeps it).  Docker mode only; needs sudo (cgroup files are root's).
+#
+# The kernel limits READS and WRITES separately: each direction may use io_iops / io_mbps.  A cloud
+# disk counts both together, so this cap is somewhat more generous when both run at full speed.
+#
+# Requires: io_node, io_iops (0 = no IOPS limit), io_mbps (0 = no throughput limit).
+# Sets: io_cap ({device, limits}).
+
+- name: Cap the disk I/O of {{ io_node }} -- {{ io_iops }} IOPS, {{ io_mbps }} MB/s per direction
+  become: true
+  ansible.builtin.shell: |
+    set -e
+    root=$(docker info -f '{{ '{{' }}.DockerRootDir{{ '}}' }}')
+    src=$(findmnt -no SOURCE -T "$root")
+    disk=$(lsblk -no PKNAME "$src" | head -1)            # the whole disk of a partition (io.max needs it)
+    [ -n "$disk" ] || disk=$(basename "$src")
+    mm=$(lsblk -dno MAJ:MIN "/dev/$disk" | tr -d ' ')
+    id=$(docker inspect -f '{{ '{{' }}.Id{{ '}}' }}' {{ io_node }})
+    cg=/sys/fs/cgroup/system.slice/docker-$id.scope; [ -d "$cg" ] || cg=/sys/fs/cgroup/docker/$id
+    [ -f "$cg/io.max" ] || { echo "no io.max in $cg (cgroup v2 io controller missing)" >&2; exit 1; }
+    lim=""
+    {% if io_iops | int > 0 %}lim="$lim riops={{ io_iops | int }} wiops={{ io_iops | int }}"{% endif %}
+
+    {% if io_mbps | int > 0 %}lim="$lim rbps={{ (io_mbps | int) * 1000000 }} wbps={{ (io_mbps | int) * 1000000 }}"{% endif %}
+
+    echo "$mm$lim" > "$cg/io.max"
+    echo "/dev/$disk"
+    grep "^$mm " "$cg/io.max"
+  args:
+    executable: /bin/bash
+  register: _io_cap
+  changed_when: true
+
+- name: Keep what was set
+  ansible.builtin.set_fact:
+    io_cap:
+      device: "{{ _io_cap.stdout_lines[0] }}"
+      limits: "{{ _io_cap.stdout_lines[1] }}"
+
+- name: Disk I/O cap in place
+  ansible.builtin.debug:
+    msg: "{{ io_node }}: {{ io_cap.device }} -> {{ io_cap.limits }}"

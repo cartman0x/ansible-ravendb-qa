@@ -1,0 +1,20 @@
+# scenarios/company-1/RKC1/snapshot.yml -- task file, included by rkc1.yml.
+# GETs the revisions list of every seeded id and sets `snap` = { "<id>": <revision count> }.
+# Requires: sanity_all_ids, base_url, sanity_db (set by rkc1.yml).
+
+- name: "Snapshot -- GET revisions for {{ sanity_all_ids | length }} ids"
+  ansible.builtin.uri:
+    url: "{{ base_url }}/databases/{{ sanity_db }}/revisions?id={{ item | urlencode }}&pageSize=1024"
+    client_cert: "{{ cert_dir }}/client.pem"
+    ca_path: "{{ cert_ca_crt }}"
+    return_content: true
+  loop: "{{ sanity_all_ids }}"
+  loop_control:
+    label: "{{ item }}"
+  register: _rev
+
+- name: Snapshot -- build id -> revision count map
+  ansible.builtin.set_fact:
+    snap: >-
+      {{ dict(_rev.results | map(attribute='item')
+              | zip(_rev.results | map(attribute='json') | map(attribute='Results') | map('length'))) }}

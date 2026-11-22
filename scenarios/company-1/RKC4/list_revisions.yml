@@ -1,0 +1,33 @@
+# scenarios/company-1/RKC4/list_revisions.yml -- task file.
+# Lists every document's revisions on one node and sets `<repro_list_as>` (a fact name) to
+#   {id: {cvs: [change vectors], count, copies}}
+# copies = rows that are another row's TWIN: the same revision listed again under a differently
+# spelled change vector (same etag-dbid entries; node tags and entry order ignored -- the same
+# identity the PR's tests and its hash use).
+# Requires: repro_list_url (node base URL), repro_list_as, repro_docs, repro_db.
+
+- name: List revisions on {{ repro_list_url }}
+  ansible.builtin.uri:
+    url: "{{ repro_list_url }}/databases/{{ repro_db }}/revisions?id={{ item.id | urlencode }}&metadataOnly=true&pageSize=1024"
+    client_cert: "{{ cert_dir }}/client.pem"
+    ca_path: "{{ cert_ca_crt }}"
+    status_code: [200, 404]
+  loop: "{{ repro_docs }}"
+  loop_control: { label: "{{ item.id }}" }
+  register: _revs
+
+- name: Keep the listing as {{ repro_list_as }}
+  ansible.builtin.set_fact:
+    "{{ repro_list_as }}": >-
+      {%- set out = {} -%}
+      {%- for r in _revs.results -%}
+      {%- set cvs = (r.json.Results | default([]) | map(attribute='@metadata') | map(attribute='@change-vector') | list)
+                    if r.status == 200 else [] -%}
+      {%- set keys = [] -%}
+      {%- for cv in cvs -%}
+      {%- set _ = keys.append(cv.split(',') | map('trim') | map('regex_replace', '^[^:]+:', '') | sort | join(',')) -%}
+      {%- endfor -%}
+      {%- set _ = out.update({r.item.id: {'cvs': cvs, 'count': cvs | length,
+                                          'copies': (cvs | length) - (keys | unique | list | length)}}) -%}
+      {%- endfor -%}
+      {{ out }}

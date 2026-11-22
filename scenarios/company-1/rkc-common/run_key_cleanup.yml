@@ -1,0 +1,156 @@
+# scenarios/company-1/rkc-common/run_key_cleanup.yml -- task file.
+# Waits for the KEY CLEANUP -- the server loads the db at startup and the cleanup starts once it is
+# loaded, so it may already be running when this file starts -- until "is done", and --
+# unless kc_cleaner_during is 'off' -- runs the TOMBSTONE CLEANER the moment the key cleanup logs
+# its first progress line, asserting that it fires before "is done" and that every REVISION
+# tombstone is still there afterwards (only revision tombstones are kept while the key cleanup
+# runs; the cleaner may delete attachment / document tombstones).
+# Requires: kc_node, kc_db, kc_cleaner_during (required|optional|off), plus rkc-common/vars.yml.
+# Optional: cleanup_universe (enables the early stop -- see rkc-common/wait_cleanup.yml),
+#           kc_load_timeout_secs (default 600) -- how long to wait for the db to come online; on a
+#           big 6.2 db its load includes the 6.2 -> 7.x schema upgrade, which keeps it offline.
+#           kc_revision_tombstones_before -- revision tombstones on 6.2 (rkc-common/tombstone_kinds.yml);
+#           without it the cleaner's run is reported, not checked.
+# Sets: cleanup_lines, cleaner_during, db_load_secs (seconds THIS file waited for the db to come
+#       online -- the load began at server startup, so it is a lower bound of the load time).
+# NOTE: the trigger is armed after the server started, so on a small db the cleanup can finish
+#       before it -- it then reports MISSED (kc_cleaner_during: required fails, optional skips).
+
+# Runs INSIDE the container so it reacts within ~0.1s: as soon as the key cleanup logs its
+# first progress line (and not yet "is done"), it runs the tombstone cleaner via the server's
+# own admin cert and records when.  If the cleanup already started, it fires right away.
+- name: Arm the tombstone-cleaner trigger for the key cleanup's first progress line
+  ansible.builtin.shell: |
+    docker exec {{ kc_node }} sh -c '
+      L={{ log_dir }}; DB={{ kc_db }}
+      has() { grep -rhF -- "$1" $L 2>/dev/null | grep -qF "|$DB|"; }
+      end=$(( $(date +%s) + {{ (kc_load_timeout_secs | default(600) | int) + (cleanup_timeout_secs | int) }} ))
+      while [ $(date +%s) -lt $end ]; do
+        if has "{{ cleanup_done_pattern }}"; then echo "MISSED"; exit 0; fi
+        if has "{{ cleanup_progress_pattern }}"; then
+          T=$(date -u "+%Y-%m-%d %H:%M:%S.%N" | cut -c1-24)
+          R=$(curl -sS -X POST -k --cert /etc/ravendb/security/server.pem --key /etc/ravendb/security/server.key \
+                https://localhost:443/databases/$DB/admin/tombstones/cleanup)
+          echo "TRIGGERED"; echo "TRIGGERED_AT=$T"; echo "RESULT=$R"; exit 0
+        fi
+        sleep 0.1
+      done
+      echo "TIMEOUT"'
+  async: "{{ (kc_load_timeout_secs | default(600) | int) + (cleanup_timeout_secs | int) + 60 }}"
+  poll: 0
+  register: _trigger_job
+  changed_when: false
+  when: kc_cleaner_during != 'off'
+
+# One quiet task (no "FAILED - RETRYING" noise): poll /stats until it answers 200.  Until then the
+# server answers 503 "still loading" or times out -- on a big 6.2 db that is the schema upgrade.
+- name: >-
+    Wait for {{ kc_db }} to come online (loaded by the server at startup) -- waits quietly up to
+    {{ ((kc_load_timeout_secs | default(600) | int) / 60) | round | int }} min
+  ansible.builtin.shell: |
+    start=$(date +%s); end=$((start + {{ kc_load_timeout_secs | default(600) | int }})); last=none
+    while [ $(date +%s) -lt $end ]; do
+      last=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 \
+               --cert {{ cert_dir }}/client.pem --cacert {{ cert_ca_crt }} \
+               https://{{ kc_node }}.{{ ravendb_domain }}:443/databases/{{ kc_db }}/stats) || true
+      if [ "$last" = 200 ]; then echo "LOADED_AFTER_SECS=$(( $(date +%s) - start ))"; exit 0; fi
+      sleep 15
+    done
+    echo "{{ kc_db }} did not load within {{ kc_load_timeout_secs | default(600) | int }}s (last HTTP status: $last)" >&2
+    exit 1
+  args:
+    executable: /bin/bash
+  register: _load
+  changed_when: false
+
+- name: Keep how long the db took to come online
+  ansible.builtin.set_fact:
+    db_load_secs: "{{ _load.stdout.split('=') | last | int }}"
+
+- name: First load of {{ kc_db }} after the upgrade
+  ansible.builtin.debug:
+    msg: >-
+      {{ kc_db }} online after {{ (db_load_secs | int) // 3600 }}h{{ '%02d' | format(((db_load_secs | int) % 3600) // 60) }}m
+      of waiting here (the server started loading it at startup, so the load -- on a 6.2 db incl.
+      the schema upgrade -- took at least this long)
+
+- name: Wait for the key cleanup to finish, fail on any cleanup error line
+  ansible.builtin.include_tasks: ../rkc-common/wait_cleanup.yml
+  vars:
+    cleanup_node: "{{ kc_node }}"
+    cleanup_db: "{{ kc_db }}"
+
+- name: Collect the trigger's result
+  ansible.builtin.async_status:
+    jid: "{{ _trigger_job.ansible_job_id }}"
+  register: _trigger
+  until: _trigger.finished
+  retries: 30
+  delay: 2
+  when: kc_cleaner_during != 'off'
+
+- name: Read when the key cleanup logged "is done"
+  ansible.builtin.shell: >-
+    docker exec {{ kc_node }} sh -c
+    "grep -rhF -- '{{ cleanup_done_pattern }}' {{ log_dir }} 2>/dev/null | grep -F '|{{ kc_db }}|' | head -1 | cut -c1-24"
+  register: _done_at
+  changed_when: false
+  when: kc_cleaner_during != 'off'
+
+- name: Parse the trigger's result
+  ansible.builtin.set_fact:
+    cleaner_during: >-
+      {%- set out = {'outcome': _trigger.stdout_lines | first | default('NO OUTPUT'),
+                      'done_at': _done_at.stdout | trim} -%}
+      {%- for line in _trigger.stdout_lines if '=' in line -%}
+      {%- set kv = line.split('=', 1) -%}
+      {%- set _ = out.update({kv[0] | lower: kv[1]}) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: kc_cleaner_during != 'off'
+
+- name: Report the trigger
+  ansible.builtin.debug:
+    msg: >-
+      tombstone cleaner during the key cleanup: {{ cleaner_during.outcome }}
+      {%- if cleaner_during.outcome == 'TRIGGERED' %} at {{ cleaner_during.triggered_at }}
+      (key cleanup done at {{ cleaner_during.done_at }}), server said {{ cleaner_during.result }}{% endif %}
+  when: kc_cleaner_during != 'off'
+
+- name: Assert the trigger fired during the key cleanup
+  ansible.builtin.assert:
+    that:
+      - cleaner_during.outcome == 'TRIGGERED'
+      - cleaner_during.triggered_at < cleaner_during.done_at
+    fail_msg: >-
+      The tombstone cleaner was not run during the key cleanup ({{ cleaner_during.outcome }}
+      {{- ', triggered ' ~ cleaner_during.triggered_at ~ ' but done at ' ~ cleaner_during.done_at
+          if cleaner_during.outcome == 'TRIGGERED' else '' }}).  The key cleanup was too short
+      to hit -- enlarge the pruned shape, or run with -e <scenario>_cleaner_during=optional.
+  when: kc_cleaner_during == 'required'
+
+# Nothing else deletes tombstones before the scenario runs the cleaner again, so counting them now
+# (after "is done") shows what the run during the cleanup deleted.
+- name: Tombstones by kind after the key cleanup
+  ansible.builtin.include_tasks: ../rkc-common/tombstone_kinds.yml
+  vars: { tk_node: "{{ kc_node }}", tk_db: "{{ kc_db }}" }
+  when: kc_cleaner_during != 'off' and cleaner_during.outcome == 'TRIGGERED'
+
+- name: Keep what the cleaner deleted during the key cleanup
+  ansible.builtin.set_fact:
+    cleaner_during: >-
+      {{ cleaner_during | combine({'deleted': (cleaner_during.result | from_json).Value | int,
+                                   'kinds_after': tombstone_kinds}) }}
+  when: kc_cleaner_during != 'off' and cleaner_during.outcome == 'TRIGGERED'
+
+- name: Assert the tombstone cleaner kept every revision tombstone during the key cleanup
+  ansible.builtin.assert:
+    that: cleaner_during.kinds_after.revisions | int == kc_revision_tombstones_before | int
+    fail_msg: >-
+      revision tombstones {{ kc_revision_tombstones_before }} on 6.2 -> {{ cleaner_during.kinds_after.revisions }}
+      after the tombstone cleaner ran during the key cleanup (it deleted {{ cleaner_during.deleted }} in all;
+      triggered {{ cleaner_during.triggered_at }}, cleanup done {{ cleaner_during.done_at }}).  Revision
+      tombstones must be kept until the key cleanup is done.  By kind now: {{ cleaner_during.kinds_after }}
+  when:
+    - kc_cleaner_during != 'off' and cleaner_during.outcome == 'TRIGGERED'
+    - kc_revision_tombstones_before | default('') | string | length > 0

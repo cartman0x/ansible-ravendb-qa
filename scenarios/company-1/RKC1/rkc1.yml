@@ -1,0 +1,283 @@
+##################################################################################################
+# scenarios/company-1/RKC1/rkc1.yml -- smallest end-to-end run of the 6.2 -> 7.2 revisions key
+# cleanup on ONE node with a small data set: proves the harness, not a load or timing test.
+# Docker mode only (log reads use `docker exec`).  Lab: run.sh in this folder.
+#
+# RUN
+#   ansible-playbook scenarios/company-1/RKC1/rkc1.yml -K \
+#       -e custom_build=$PWD/builds/raven-prNNN.deb --skip-tags download
+#
+#   --skip-tags download is REQUIRED: without it the upgrade step downloads a stock build
+#   instead of installing custom_build.  The pre-flight below fails if it is missing.
+##################################################################################################
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/_internal/ensure_ravendb_venv.yml
+
+
+- name: Sanity -- pre -- validate inputs and show plan
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - custom_build is defined
+          - custom_build is match('^https?://') or custom_build is file
+          - "'download' in ansible_skip_tags"
+          - target_mode | default('docker') == 'docker'
+        fail_msg: >-
+          Required: -e custom_build=<path or URL to the v_new .deb> AND --skip-tags download.
+          Docker mode only.
+
+    - name: Build the list of seeded ids
+      ansible.builtin.set_fact:
+        base_url: "https://{{ sanity_node }}.{{ ravendb_domain }}:443"
+        sanity_all_ids: "{{ range(sanity_doc_count | int) | map('regex_replace', '^', sanity_id_prefix ~ '/') | list }}"
+        sanity_expected_docs: "{{ sanity_doc_count | int }}"
+
+    - name: Show plan
+      ansible.builtin.debug:
+        msg: >-
+          Plan -- revisions key cleanup sanity check:  node={{ sanity_node }}  db={{ sanity_db }}  ids={{ sanity_all_ids | length }}
+          expected_docs={{ sanity_expected_docs }}  v_new={{ custom_build }}
+
+
+- name: Sanity -- step 1 -- seed on 6.2 and record the baseline
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  vars:
+    _conn: &conn
+      ravendb_domain: "{{ ravendb_domain }}"
+      client_cert: "{{ cert_dir }}/client.pem"
+      ca_cert: "{{ cert_ca_crt }}"
+  tasks:
+    - name: Read server version
+      ansible.builtin.uri:
+        url: "{{ base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_before
+
+    - name: Assert the node is on 6.2
+      ansible.builtin.assert:
+        that: v_before.json.FullVersion is match('^6\.2\.')
+        fail_msg: "Expected a 6.2 node, got {{ v_before.json.FullVersion }} -- install with -e rdb_version=6.2.x"
+
+    - name: Create {{ sanity_db }} (replication factor 1)
+      ravendb.ravendb.database:
+        url: "{{ base_url }}"
+        database_name: "{{ sanity_db }}"
+        certificate_path: "{{ cert_dir }}/client.pem"
+        ca_cert_path: "{{ cert_ca_crt }}"
+        replication_factor: 1
+        state: present
+
+    - name: Configure revisions (Default keep {{ sanity_default_keep }})
+      ravendb_revisions:
+        <<: *conn
+        target: "{{ sanity_node }}"
+        db_name: "{{ sanity_db }}"
+        default_keep: "{{ sanity_default_keep | int }}"
+        default_max_age_secs: 0
+
+    - name: Seed docs with revisions
+      ravendb_writes:
+        <<: *conn
+        kind: docs_revisions
+        target: "{{ sanity_node }}"
+        db_name: "{{ sanity_db }}"
+        count: "{{ sanity_doc_count | int }}"
+        revs_per_doc: "{{ sanity_revs_per_doc | int }}"
+        id_prefix: "{{ sanity_id_prefix }}"
+
+    - name: Snapshot revision counts (before)
+      ansible.builtin.include_tasks: snapshot.yml
+
+    - name: Keep the before snapshot
+      ansible.builtin.set_fact:
+        counts_before: "{{ snap }}"
+
+    - name: Assert exact revision counts on 6.2
+      ansible.builtin.assert:
+        that: counts_before.values() | unique | list == [sanity_revs_per_doc | int]
+        fail_msg: "expected {{ sanity_revs_per_doc }} revisions per doc, got distinct counts {{ counts_before.values() | unique | list }}"
+
+    - name: Read /stats (before)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ sanity_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_before
+
+    - name: Assert doc count on 6.2
+      ansible.builtin.assert:
+        that: stats_before.json.CountOfDocuments | int == sanity_expected_docs | int
+        fail_msg: "expected {{ sanity_expected_docs }} docs, got {{ stats_before.json.CountOfDocuments }}"
+
+    - name: Baseline summary
+      ansible.builtin.debug:
+        msg:
+          - "version          {{ v_before.json.FullVersion }}"
+          - "docs             {{ stats_before.json.CountOfDocuments }}"
+          - "revision docs    {{ stats_before.json.CountOfRevisionDocuments | default('?') }}"
+          - "tombstones       {{ stats_before.json.CountOfTombstones | default('?') }}"
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  vars:
+    target: "{{ sanity_node | default('1a') }}"
+
+
+- name: Sanity -- step 3 -- load db and wait for the cleanup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Read server version (after upgrade)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_after
+
+    - name: Assert the version changed
+      ansible.builtin.assert:
+        that: v_after.json.FullVersion != v_before.json.FullVersion
+        fail_msg: "still on {{ v_after.json.FullVersion }} -- the upgrade did not install custom_build"
+
+    - name: Load {{ sanity_db }} (first access starts the cleanup)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ sanity_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _load
+      retries: 30
+      delay: 2
+      until: _load is succeeded
+
+    - name: Wait for the cleanup to finish, fail on any cleanup error line
+      ansible.builtin.include_tasks: ../rkc-common/wait_cleanup.yml
+      vars:
+        cleanup_node: "{{ sanity_node }}"
+
+
+- name: Sanity -- step 4 -- verify data after the cleanup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Snapshot revision counts (after)
+      ansible.builtin.include_tasks: snapshot.yml
+
+    - name: Assert revision counts unchanged for every doc
+      ansible.builtin.assert:
+        that: _diff | length == 0
+        fail_msg: "{{ _diff | length }} id(s) changed (first 20, before -> after): {{ _diff[:20] }}"
+      vars:
+        _diff: >-
+          {%- set out = [] -%}
+          {%- for k, v in counts_before.items() if snap.get(k) != v -%}
+          {%- set _ = out.append(k ~ ': ' ~ v ~ ' -> ' ~ snap.get(k)) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Read /stats (after)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ sanity_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_after
+
+    - name: Assert doc count unchanged
+      ansible.builtin.assert:
+        that: stats_after.json.CountOfDocuments | int == sanity_expected_docs | int
+        fail_msg: "expected {{ sanity_expected_docs }} docs, got {{ stats_after.json.CountOfDocuments }}"
+
+    - name: No orphan revisions
+      ravendb_diagnostic:
+        kind: orphan_revisions
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        db_name: "{{ sanity_db }}"
+        nodes: ["{{ sanity_node }}"]
+        assert_mode: true
+      register: _orphans
+
+    - name: Count cleanup log lines before the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ sanity_node }}"
+
+    - name: Keep the count from before the restart
+      ansible.builtin.set_fact:
+        lines_before_restart: "{{ cleanup_line_count }}"
+
+    - name: Post-cleanup summary
+      ansible.builtin.debug:
+        msg:
+          - "version          {{ v_before.json.FullVersion }} -> {{ v_after.json.FullVersion }}"
+          - "docs             {{ stats_before.json.CountOfDocuments }} -> {{ stats_after.json.CountOfDocuments }}"
+          - "revision docs    {{ stats_before.json.CountOfRevisionDocuments | default('?') }} -> {{ stats_after.json.CountOfRevisionDocuments | default('?') }}"
+          - "tombstones       {{ stats_before.json.CountOfTombstones | default('?') }} -> {{ stats_after.json.CountOfTombstones | default('?') }}  (info only)"
+          - "{{ _orphans.msg }}"
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/restart_ravendb.yml
+  vars:
+    target: "{{ sanity_node | default('1a') }}"
+
+- name: Sanity -- step 5 -- the cleanup must not run again after restart
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Load {{ sanity_db }} again
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ sanity_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _reload
+      retries: 30
+      delay: 2
+      until: _reload is succeeded
+
+    - name: Watch the log for {{ rerun_quiet_secs }}s
+      ansible.builtin.pause:
+        seconds: "{{ rerun_quiet_secs | int }}"
+
+    - name: Count cleanup log lines after the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ sanity_node }}"
+
+    - name: Assert no new cleanup lines
+      ansible.builtin.assert:
+        that: cleanup_line_count | int == lines_before_restart | int
+        fail_msg: >-
+          cleanup ran again after restart: {{ lines_before_restart }} ->
+          {{ cleanup_line_count }} cleanup log lines
+
+    - name: Snapshot revision counts (after restart)
+      ansible.builtin.include_tasks: snapshot.yml
+
+    - name: Assert revision counts still unchanged
+      ansible.builtin.assert:
+        that: snap == counts_before
+        fail_msg: "revision counts changed after restart"
+
+    - name: "RESULT: revisions key cleanup sanity check -- PASSED"
+      ansible.builtin.debug:
+        msg:
+          - "PASSED: revisions key cleanup sanity check (small db, one node), upgraded in place {{ v_before.json.FullVersion }} -> {{ v_after.json.FullVersion }}"
+          - "Key cleanup ran: {% set l = cleanup_lines.stdout_lines | default([]) | sort -%}{{ (l | first)[:19] ~ ' -> ' ~ (l | last)[:19] ~ ' UTC' if l else 'no log lines' }}"
+          - "OK  revision counts of all {{ sanity_all_ids | length }} docs unchanged, doc count unchanged, no orphan revisions"
+          - "OK  the key cleanup did not run again after a restart ({{ cleanup_line_count }} cleanup log lines, none new)"

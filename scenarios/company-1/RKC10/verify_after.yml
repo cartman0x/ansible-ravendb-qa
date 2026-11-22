@@ -1,0 +1,287 @@
+##################################################################################################
+# scenarios/company-1/RKC10/verify_after.yml -- the checks of RKC10 (RKC5's steps 4 and 5), run on
+# their own after the test stopped at its cleanup time limit while the server kept cleaning.
+#
+# RKC5/rkc5.yml keeps its 6.2 baseline (/stats, sample fingerprints) only in memory, so when it
+# stops at rkc5_cleanup_timeout_secs the checks never run.  The lab stays up and the cleanup goes
+# on; once every db has logged "Revisions key cleanup is done", run this instead of starting over.
+#
+# The baseline is recomputed, not read back: the shapes are deterministic, and the run already
+# asserted on 6.2 that every db had EXACTLY these totals and the sample EXACTLY these revision counts
+# ("Assert exact totals on 6.2", "Assert exact revision count for every sampled doc on 6.2").  So:
+#   1. every db logged "is done" and no cleanup error line
+#   2. every sampled doc has its exact revision count, attachments read back with their content
+#   3. /stats: docs (+ the probe's docs on rkc5_probe_cleaning_db), revisions, unique attachments,
+#      tombstones == the 6.2 totals
+#   4. no orphan revisions
+#   5. restart: the key cleanup does not run again; the sample's fingerprints are as in 2.
+# Not possible here: comparing the sample's full fingerprints (body version, attachment hashes) with
+# the 6.2 ones -- those were in memory only.  Counts + attachment content are checked instead.
+#
+# RUN (repo root, same lab, same vars as the RKC10 run):
+#   ansible-playbook scenarios/company-1/RKC10/verify_after.yml -e @scenarios/company-1/RKC10/vars.yml
+# Optional: -e rkc10_att_read_back=N  (attachments the 6.2 run read back per db: "(N read back)" in
+#   its Baseline summary; 7 at rkc5_scale 0.1)
+# Writes: <rkc5_out_dir>/verify-after.json
+##################################################################################################
+
+- name: RKC10 checks -- recompute the 6.2 totals and the sample
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, ../RKC5/vars.yml]
+  tasks:
+    # Same as ../RKC5/rkc5.yml "Scale the shapes" + "Compute exact totals and the sample".
+    - name: Scale the shapes
+      ansible.builtin.set_fact:
+        base_url: "https://{{ rkc5_node }}.{{ ravendb_domain }}:443"
+        rkc5_scaled: >-
+          {%- set out = [] -%}
+          {%- for s in rkc5_shapes -%}
+          {%- set docs = [(s.docs | int * rkc5_scale | float) | int, 1] | max -%}
+          {%- set att = [(s.att_docs | default(0) | int * rkc5_scale | float) | int, docs] | min -%}
+          {%- set _ = out.append(s | combine({'docs': docs, 'att_docs': att})) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Compute exact totals and the sample
+      ansible.builtin.set_fact:
+        rkc5_expected: >-
+          {%- set t = {'docs': 0, 'revisions': 0, 'tombstones_min': 0, 'unique_attachments': 0} -%}
+          {%- for s in rkc5_scaled -%}
+          {%- set every = s.att_every | default(0) | int -%}
+          {%- set n_att = s.att_docs if every > 0 else 0 -%}
+          {%- set per_att = s.revs + (s.revs // every if every > 0 else 0) -%}
+          {%- set per_plain = s.revs -%}
+          {%- if s.collection == 'Pruned' -%}
+          {%- set kept_att = [per_att, rkc5_pruned_keep | int] | min -%}
+          {%- set kept_plain = [per_plain, rkc5_pruned_keep | int] | min -%}
+          {%- set _ = t.update({'tombstones_min': t.tombstones_min + n_att * (per_att - kept_att)
+                                                  + (s.docs - n_att) * (per_plain - kept_plain)}) -%}
+          {%- set per_att, per_plain = kept_att, kept_plain -%}
+          {%- endif -%}
+          {%- set _ = t.update({'docs': t.docs + s.docs,
+                                'revisions': t.revisions + n_att * per_att + (s.docs - n_att) * per_plain,
+                                'unique_attachments': t.unique_attachments + n_att * (s.revs // every if every > 0 else 0)}) -%}
+          {%- endfor -%}
+          {{ t }}
+        rkc5_sample: >-
+          {%- set out = {} -%}
+          {%- for s in rkc5_scaled -%}
+          {%- set every = s.att_every | default(0) | int -%}
+          {%- set nums = [0, s.docs - 1] -%}
+          {%- for i in range(rkc5_sample_per_shape | int) -%}
+          {%- set _ = nums.append((i * 104729 + 7919) % s.docs) -%}
+          {%- endfor -%}
+          {%- for n in nums | unique -%}
+          {%- set with_att = n < s.att_docs and every > 0 -%}
+          {%- set total = s.revs + ((s.revs // every) if with_att else 0) -%}
+          {%- set _ = out.update({s.prefix ~ '/' ~ n:
+                ([total, rkc5_pruned_keep | int] | min) if s.collection == 'Pruned' else total}) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Plan
+      ansible.builtin.debug:
+        msg: >-
+          {{ rkc5_dbs | join(', ') }} on {{ rkc5_node }} -- 6.2 totals per db: {{ rkc5_expected.docs }} docs,
+          {{ rkc5_expected.revisions }} revisions, {{ rkc5_expected.tombstones_min }} tombstones,
+          {{ rkc5_expected.unique_attachments }} attachments; sample {{ rkc5_sample | length }} docs per db
+
+
+- name: RKC10 checks -- after the key cleanup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, ../RKC5/vars.yml]
+  tasks:
+    - name: Read the key-cleanup lines of {{ rkc5_node }}
+      ansible.builtin.shell: >-
+        docker exec {{ rkc5_node }} sh -c "grep -rhiF -- '{{ cleanup_any_pattern }}' {{ log_dir }} 2>/dev/null"
+        | grep -v ' progress: '
+      register: _lines
+      changed_when: false
+      failed_when: false
+
+    - name: Assert every db logged "is done" and no error line
+      ansible.builtin.assert:
+        that:
+          - _done | length == 1
+          - _errors | length == 0
+        fail_msg: "{{ item }}: 'is done' lines {{ _done | length }}, error lines {{ _errors[:5] }}"
+        quiet: true
+      vars:
+        _mine: "{{ _lines.stdout_lines | select('search', '\\|' ~ item ~ '\\|') | list }}"
+        _done: "{{ _mine | select('search', cleanup_done_pattern) | list }}"
+        _errors: "{{ _lines.stdout_lines | select('search', '(?i)' ~ cleanup_error_pattern) | select('search', '\\|' ~ item ~ '\\|') | list }}"
+      loop: "{{ rkc5_dbs }}"
+
+    - name: Fingerprint the sample and read its attachments back
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ rkc5_node }}"
+        db_name: "{{ item }}"
+        ids: "{{ rkc5_sample.keys() | list }}"
+        verify_attachment_content: true
+      loop: "{{ rkc5_dbs }}"
+      register: _fp_after
+
+    - name: Assert every sampled doc has its exact revision count, attachments read back
+      ansible.builtin.assert:
+        that:
+          - _wrong | length == 0
+          - item.attachments_checked | int == rkc10_att_read_back | default(7) | int
+        fail_msg: >-
+          {{ item.item }}: {{ _wrong | length }} sampled doc(s) with a wrong revision count (first 20): {{ _wrong[:20] }};
+          attachments read back {{ item.attachments_checked }} (on 6.2: {{ rkc10_att_read_back | default(7) }})
+        quiet: true
+      vars:
+        _wrong: >-
+          {%- set out = [] -%}
+          {%- for k, v in rkc5_sample.items() if item.fingerprints[k].count != v -%}
+          {%- set _ = out.append(k ~ ': ' ~ item.fingerprints[k].count ~ ' != ' ~ v) -%}
+          {%- endfor -%}
+          {{ out }}
+      loop: "{{ _fp_after.results }}"
+      loop_control: { label: "{{ item.item }}" }
+
+    - name: Keep the fingerprints
+      ansible.builtin.set_fact:
+        fp_after: "{{ dict(rkc5_dbs | zip(_fp_after.results | map(attribute='fingerprints'))) }}"
+
+    - name: Read /stats
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ item }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 300
+      loop: "{{ rkc5_dbs }}"
+      register: _stats_after
+
+    - name: Probe docs written to {{ rkc5_probe_cleaning_db }} while it was cleaned
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ rkc5_probe_cleaning_db }}/collections/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _probe_coll
+      when: rkc5_probe_cleaning_db | length > 0
+
+    - name: Assert totals are the 6.2 totals (docs, revisions, attachments, tombstones)
+      ansible.builtin.assert:
+        that:
+          - a.CountOfDocuments | int == (rkc5_expected.docs | int) + (_probe_docs | int)
+          - a.CountOfRevisionDocuments | int == rkc5_expected.revisions | int
+          - a.CountOfUniqueAttachments | int == rkc5_expected.unique_attachments | int
+          - a.CountOfTombstones | int == rkc5_expected.tombstones_min | int
+        fail_msg: >-
+          {{ item.item }} 6.2 -> now: docs {{ rkc5_expected.docs }} -> {{ a.CountOfDocuments }} (+{{ _probe_docs }} probe docs expected),
+          revisions {{ rkc5_expected.revisions }} -> {{ a.CountOfRevisionDocuments }},
+          unique attachments {{ rkc5_expected.unique_attachments }} -> {{ a.CountOfUniqueAttachments }},
+          tombstones {{ rkc5_expected.tombstones_min }} -> {{ a.CountOfTombstones }}
+        quiet: true
+      vars:
+        a: "{{ item.json }}"
+        _probe_docs: >-
+          {{ ((_probe_coll.json.Collections | default({})).Probe | default(0) | int)
+             if item.item == rkc5_probe_cleaning_db else 0 }}
+      loop: "{{ _stats_after.results }}"
+      loop_control: { label: "{{ item.item }}" }
+
+    - name: No orphan revisions
+      ravendb_diagnostic:
+        kind: orphan_revisions
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        db_name: "{{ item }}"
+        nodes: ["{{ rkc5_node }}"]
+        assert_mode: true
+        budget_secs: "{{ rkc5_orphan_check_budget_secs | int }}"
+      loop: "{{ rkc5_dbs }}"
+
+    - name: Count key-cleanup log lines before the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ rkc5_node }}"
+
+    - name: Keep the count from before the restart
+      ansible.builtin.set_fact:
+        lines_before_restart: "{{ cleanup_line_count }}"
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/restart_ravendb.yml
+  vars:
+    target: "{{ rkc5_node | default('1a') }}"
+
+
+- name: RKC10 checks -- the key cleanup must not run again after restart
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, ../RKC5/vars.yml]
+  tasks:
+    - name: Load every db again
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ item }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 300
+      register: _reload
+      retries: 120
+      delay: 5
+      until: _reload is succeeded
+      loop: "{{ rkc5_dbs }}"
+
+    - name: Watch the log for {{ rerun_quiet_secs }}s
+      ansible.builtin.pause:
+        seconds: "{{ rerun_quiet_secs | int }}"
+
+    - name: Count key-cleanup log lines after the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ rkc5_node }}"
+
+    - name: Assert no new key-cleanup lines
+      ansible.builtin.assert:
+        that: cleanup_line_count | int == lines_before_restart | int
+        fail_msg: "key cleanup ran again after restart: {{ lines_before_restart }} -> {{ cleanup_line_count }} cleanup log lines"
+
+    - name: Fingerprint the sample again (after restart)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ rkc5_node }}"
+        db_name: "{{ item }}"
+        ids: "{{ rkc5_sample.keys() | list }}"
+      loop: "{{ rkc5_dbs }}"
+      register: _fp_restart
+
+    - name: Assert the sample unchanged by the restart
+      ansible.builtin.assert:
+        that: item.fingerprints == fp_after[item.item]
+        fail_msg: "{{ item.item }}: revision fingerprints changed after restart"
+        quiet: true
+      loop: "{{ _fp_restart.results }}"
+      loop_control: { label: "{{ item.item }}" }
+
+    - name: Save the result
+      ansible.builtin.copy:
+        content: >-
+          {{ {'dbs': rkc5_dbs, 'expected_per_db': rkc5_expected, 'sample_per_db': rkc5_sample | length,
+              'stats_after': dict(rkc5_dbs | zip(_stats_after.results | map(attribute='json'))),
+              'cleanup_lines': lines_before_restart | int, 'result': 'PASSED'} | to_nice_json }}
+        dest: "{{ rkc5_out_dir }}/verify-after.json"
+        mode: "0644"
+
+    - name: "RESULT: RKC10 checks after the key cleanup -- PASSED"
+      ansible.builtin.debug:
+        msg:
+          - "OK  every db logged 'is done', no cleanup error line"
+          - "OK  {{ rkc5_sample | length }} sampled docs per db with their exact revision counts, attachments read back"
+          - "OK  per db: {{ rkc5_expected.docs }} docs (+ probe docs), {{ rkc5_expected.revisions }} revisions, {{ rkc5_expected.unique_attachments }} attachments, {{ rkc5_expected.tombstones_min }} tombstones -- as on 6.2"
+          - "OK  no orphan revisions"
+          - "OK  the key cleanup did not run again after a restart; sample unchanged"

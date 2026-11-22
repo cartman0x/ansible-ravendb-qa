@@ -1,0 +1,34 @@
+# scenarios/company-1/RKC4/write_version.yml -- task file, included by
+# rkc4.yml once per (version, document).  Writes {"Name": "v<N>"} to one document on the hub.
+# Cluster-wide writes keep atomic guards ON (see the header below): only then does 6.2 add the TRXN entry
+# (RAFT:n-x,TRXN:i-y), the change vector form that a 7.2.5-7.2.7 hub re-spells.  An update must
+# send the document's current change vector -- the server takes the guard index from its TRXN entry.
+# Requires: item = [version, {id, cluster_wide}], repro_hub_url, repro_db.
+
+- name: Read the current change vector of {{ item.1.id }}
+  ansible.builtin.uri:
+    url: "{{ repro_hub_url }}/databases/{{ repro_db }}/docs?id={{ item.1.id | urlencode }}&metadataOnly=true"
+    client_cert: "{{ cert_dir }}/client.pem"
+    ca_path: "{{ cert_ca_crt }}"
+    status_code: [200, 404]
+  register: _cur
+
+- name: Write v{{ item.0 }} of {{ item.1.id }} ({{ 'cluster-wide' if item.1.cluster_wide else 'normal' }})
+  ansible.builtin.uri:
+    url: "{{ repro_hub_url }}/databases/{{ repro_db }}/bulk_docs"
+    method: POST
+    client_cert: "{{ cert_dir }}/client.pem"
+    ca_path: "{{ cert_ca_crt }}"
+    # 6.2 turns atomic guards OFF for a request without a client version (it assumes a pre-5.2
+    # client: AbstractClusterTransactionRequestProcessor.CheckBackwardCompatibility) -- and with
+    # them off there is no TRXN entry.  Real clients always send this header.
+    headers:
+      Raven-Client-Version: "6.2.0.62000"
+    body_format: json
+    body: >-
+      {{ {'Commands': [{'Id': item.1.id, 'Type': 'PUT',
+                        'ChangeVector': (_cur.json.Results[0]['@metadata']['@change-vector']
+                                         if (_cur.status == 200 and item.1.cluster_wide) else none),
+                        'Document': {'Name': 'v' ~ item.0, '@metadata': {'@collection': 'Users'}}}]}
+         | combine({'TransactionMode': 'ClusterWide'} if item.1.cluster_wide else {}) }}
+    status_code: [200, 201]

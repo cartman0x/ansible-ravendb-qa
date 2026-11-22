@@ -1,0 +1,11 @@
+# scenarios/company-1/RV4/vars.yml -- inputs for
+# rv4.yml.  Every key can be overridden with -e on the command line.
+
+# Replication direction.  Writes go to the source; the destination receives incoming
+# replication.  ONLY the destination is upgraded, so a new-version node receives
+# replication from an old-version node.
+source_node: "1a"
+dest_node: "1b"
+
+# Version the destination is upgraded to (ignored when -e custom_build=... is given).
+upgrade_version: "7.2.2"

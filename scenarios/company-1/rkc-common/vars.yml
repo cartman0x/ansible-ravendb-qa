@@ -1,0 +1,49 @@
+# scenarios/company-1/rkc-common/vars.yml -- settings shared by every
+# revision-key-cleanup scenario.  Every key can be overridden with -e on the command line.
+
+# Log lines written by the cleanup (match the PR's exact text).
+cleanup_progress_pattern: "Revisions key cleanup progress"
+cleanup_done_pattern: "Revisions key cleanup is done"
+cleanup_any_pattern: "Revisions key cleanup"
+# The cleaner's error line (lower-case "revisions"; match it case-insensitively).  After it the
+# cleaner stops until the next db load.
+cleanup_error_pattern: "error occurred in the revisions key cleanup"
+
+# RavenDB log directory inside the container (check Logs.Path in /etc/ravendb/settings.json
+# if the wait times out with no lines found).
+log_dir: /var/log/ravendb/logs
+
+cleanup_timeout_secs: 600   # wait for the "is done" line(s) after the upgrade
+rerun_quiet_secs: 30        # after restart + db load, how long to watch for a (wrong) re-run
+
+# Early stop (needs the scenario to pass its shapes as cleanup_universe -- RKC3 does):
+# every cleanup_eta_every_min, scripts/cleanup_eta.py works out from the progress lines how far
+# the key cleanup is and when it will end; over cleanup_max_hours (whole cleanup, projected)
+# the run stops with the numbers.  0 = report only (/tmp/rkc-cleanup-eta-<db>.log).
+cleanup_max_hours: 0
+cleanup_eta_first_check_min: 30   # no verdict before 30 min of progress lines
+cleanup_eta_every_min: 15
+cleanup_eta_window_min: 30        # rate = progress over the last 30 min (it slows down over time)
+
+# ----- dataset snapshots in S3 ---------------------------------------------------------------------
+# Where a scenario's 6.2 dataset comes from:
+#   seed    -- write it with the loader (no S3 involved)                                 [default]
+#   build   -- write it with the loader, verify it, upload a SNAPSHOT backup to S3, then test
+#   restore -- restore that snapshot from S3 instead of writing (fails if none was built)
+# Snapshots live at s3://<bucket>/<prefix>/<scenario>/<6.2 version>/<shape hash>/ -- the hash
+# covers every input that shapes the data, so a changed vars file never restores stale data,
+# and a 6.2.20 snapshot is never restored onto 6.2.21.
+# The RavenDB server uploads/downloads directly (S3Settings); the controller needs no AWS CLI.
+dataset_source: seed
+dataset_s3_bucket: "{{ lookup('env', 'RAVENDB_QA_S3_BUCKET') }}"
+dataset_s3_region: "{{ lookup('env', 'AWS_REGION') or lookup('env', 'AWS_DEFAULT_REGION') }}"
+dataset_s3_prefix: ravendb-qa/revision-key-cleanup
+dataset_s3_timeout_secs: 3600   # per backup upload / restore download
+# dataset_source=local (RKC3): snapshots kept on THIS machine, outside the lab (teardown removes the
+# lab's backups volume), at <root>/<scenario>/<6.2 version>/<shape hash>/{snapshot/, COMPLETE}.
+dataset_local_root: "{{ lookup('env', 'RKC_SNAPSHOTS') or (lookup('env', 'HOME') ~ '/rkc-snapshots') }}"   # remote.sh: ~/$RKC_HOME/rkc-snapshots
+dataset_local_timeout_secs: 21600   # local snapshot / restore of the 300M dataset
+# With dataset_source=build: stop right after the snapshot is uploaded (no upgrade / key cleanup).
+dataset_build_only: false
+# Credentials come only from the environment (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, optional
+# AWS_SESSION_TOKEN) and are passed to ravendb_backup's no_log params -- never put them in a file.

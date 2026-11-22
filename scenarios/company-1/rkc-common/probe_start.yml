@@ -1,0 +1,18 @@
+# scenarios/company-1/rkc-common/probe_start.yml -- task file.
+# Starts scripts/write_probe.py in the background: one small user write to probe_db every
+# probe_interval_secs (collection Probe, ids probe/0..99), each timed -> <probe_csv>.
+# Stop it with probe_stop.yml.  The probe's writes add up to 100 docs in collection Probe -- turn
+# revisions off for Probe if the test counts revisions.
+# Requires: probe_node, probe_db, probe_csv, probe_max_secs, repo_root.
+# Optional: probe_interval_secs (default 0.2).  Sets: _probe_job.
+
+- name: Start the write probe on {{ probe_db }} (one write every {{ probe_interval_secs | default(0.2) }}s, collection Probe)
+  ansible.builtin.command:
+    argv: [python3, "{{ repo_root }}/scripts/write_probe.py", run, --target, "{{ probe_node }}",
+           --domain, "{{ ravendb_domain }}", --cert, "{{ cert_dir }}/client.pem", --ca, "{{ cert_ca_crt }}",
+           --db, "{{ probe_db }}", --interval, "{{ probe_interval_secs | default(0.2) | string }}",
+           --out, "{{ probe_csv }}", --stop-file, "{{ probe_csv }}.stop"]
+  async: "{{ probe_max_secs | int + 60 }}"
+  poll: 0
+  register: _probe_job
+  changed_when: false

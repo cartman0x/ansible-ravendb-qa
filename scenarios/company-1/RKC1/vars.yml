@@ -1,0 +1,15 @@
+# scenarios/company-1/RKC1/vars.yml -- inputs for rkc1.yml.
+
+# Single node.  form_clusters.yml always names the leader <cluster_id>a.
+sanity_node: "1a"
+sanity_db: db1
+
+# Default-only revisions policy set on 6.2 before seeding; keep > revs_per_doc so counts are exact.
+sanity_default_keep: 100
+
+# Seed set: ids are <sanity_id_prefix>/0 .. <sanity_id_prefix>/<count-1>, each with N revisions.
+sanity_id_prefix: sanity/plain
+sanity_doc_count: 5
+sanity_revs_per_doc: 5
+
+# Cleanup log patterns, log_dir and budgets live in ../rkc-common/vars.yml.

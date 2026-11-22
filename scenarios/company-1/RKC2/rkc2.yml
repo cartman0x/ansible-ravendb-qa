@@ -1,0 +1,723 @@
+##################################################################################################
+# scenarios/company-1/RKC2/rkc2.yml -- dataset 3: revisions with attachments + many revision
+# tombstones, 6.2 -> v_new, ONE node.  Tests correctness, not scale: the shapes are small enough
+# to verify every revision and read back every attachment.  Docker mode only (`docker exec`).
+#
+# Not covered here: the key cleanup removing DUPLICATE tombstones (needs a dataset with
+# duplicates).
+#
+# RUN (lab already on 6.2; run.sh in this folder builds the lab and runs this)
+#   ansible-playbook scenarios/company-1/RKC2/rkc2.yml -K \
+#       -e custom_build=$PWD/builds/raven-prNNN.deb --skip-tags download
+#
+# SNAPSHOTS (S3) -- needs AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION and
+# RAVENDB_QA_S3_BUCKET (or -e dataset_s3_bucket=...) in the environment:
+#   RKC2/run.sh 6.2.20 builds/raven-prNNN.deb -e dataset_source=build    # once
+#   RKC2/run.sh 6.2.20 builds/raven-prNNN.deb -e dataset_source=restore  # after
+##################################################################################################
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/_internal/ensure_ravendb_venv.yml
+
+
+- name: Attachments + tombstones -- pre -- validate inputs and show plan
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - custom_build is defined
+          - custom_build is match('^https?://') or custom_build is file
+          - "'download' in ansible_skip_tags"
+          - target_mode | default('docker') == 'docker'
+          - at_shapes | map(attribute='revs') | map('int') | max < at_default_keep | int
+          - at_shapes | selectattr('collection', '==', 'Excess') | map(attribute='revs') | map('int') | min > at_excess_keep | int
+        fail_msg: >-
+          Required: -e custom_build=<path or URL to the v_new .deb> AND --skip-tags download.
+          Docker mode only.  at_default_keep must exceed every shape's revs; Excess shapes need
+          more revs than at_excess_keep (otherwise there is no excess to keep).
+
+    - name: Validate dataset source (S3 settings checked only for build/restore)
+      ansible.builtin.assert:
+        that:
+          - dataset_source in ['seed', 'build', 'restore']
+          - dataset_source == 'seed' or dataset_s3_bucket | length > 0
+          - dataset_source == 'seed' or dataset_s3_region | length > 0
+          - dataset_source == 'seed' or lookup('env', 'AWS_ACCESS_KEY_ID') | length > 0
+          - dataset_source == 'seed' or lookup('env', 'AWS_SECRET_ACCESS_KEY') | length > 0
+          - at_cleaner_during in ['required', 'optional', 'off']
+          - not (dataset_build_only | bool) or dataset_source == 'build'
+        fail_msg: >-
+          dataset_source must be seed|build|restore.  build/restore need RAVENDB_QA_S3_BUCKET (or
+          -e dataset_s3_bucket=...), AWS_REGION, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in the
+          environment.  at_cleaner_during must be required|optional|off.  dataset_build_only needs dataset_source=build.
+        quiet: true
+
+    - name: Compute ids and expected revision counts
+      ansible.builtin.set_fact:
+        base_url: "https://{{ at_node }}.{{ ravendb_domain }}:443"
+        repo_root: "{{ playbook_dir }}/../../.."
+        at_expected: >-
+          {%- set out = {} -%}
+          {%- for s in at_shapes -%}
+          {%- for n in range(s.docs | int) -%}
+          {%- set with_att = n < s.att_docs | default(0) | int and s.att_every | default(0) | int > 0 -%}
+          {%- set total = s.revs | int + ((s.revs | int // s.att_every | int) if with_att else 0) -%}
+          {%- set _ = out.update({s.prefix ~ '/' ~ n:
+                ([total, at_pruned_keep | int] | min) if s.collection == 'Pruned' else total}) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+        at_min_revision_tombstones: >-
+          {%- set acc = [] -%}
+          {%- for s in at_shapes if s.collection == 'Pruned' -%}
+          {%- for n in range(s.docs | int) -%}
+          {%- set with_att = n < s.att_docs | default(0) | int and s.att_every | default(0) | int > 0 -%}
+          {%- set total = s.revs | int + ((s.revs | int // s.att_every | int) if with_att else 0) -%}
+          {%- set _ = acc.append([total - at_pruned_keep | int, 0] | max) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ acc | sum }}
+        # Docs whose collection caps revisions (Pruned, Excess) -> {collection, keep}.  The
+        # "next write" step writes each once and expects it to end at exactly `keep`.
+        at_limited: >-
+          {%- set keeps = {'Pruned': at_pruned_keep | int, 'Excess': at_excess_keep | int} -%}
+          {%- set out = {} -%}
+          {%- for s in at_shapes if s.collection in keeps -%}
+          {%- for n in range(s.docs | int) -%}
+          {%- set _ = out.update({s.prefix ~ '/' ~ n: {'collection': s.collection, 'keep': keeps[s.collection]}}) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Keep the id lists and the next-write tombstone floor
+      ansible.builtin.set_fact:
+        at_all_ids: "{{ at_expected.keys() | list }}"
+        at_excess_ids: "{{ at_limited | dict2items | selectattr('value.collection', '==', 'Excess') | map(attribute='key') | list }}"
+        # One more write per limited doc: its revisions (+1) are cut back to `keep`, and
+        # every revision cut leaves a revision tombstone.
+        at_min_tombstones_after_write: >-
+          {%- set acc = [] -%}
+          {%- for k, v in at_limited.items() -%}
+          {%- set _ = acc.append([at_expected[k] + 1 - v.keep, 0] | max) -%}
+          {%- endfor -%}
+          {{ acc | sum }}
+        # Everything that shapes the 6.2 data.  Part of the snapshot's S3 path, so a changed
+        # vars file can never restore a snapshot built from different data.
+        at_shape_hash: >-
+          {{ ({'db': at_db, 'shapes': at_shapes, 'default_keep': at_default_keep | int,
+               'pruned_keep': at_pruned_keep | int, 'excess_keep': at_excess_keep | int,
+               'tombstone_interval': at_tombstone_cleanup_interval_min | int}
+              | to_json(sort_keys=true) | hash('sha1'))[:12] }}
+
+    - name: Show plan
+      ansible.builtin.debug:
+        msg: >-
+          Plan -- revisions key cleanup with attachments + tombstones:  node={{ at_node }}  db={{ at_db }}  docs={{ at_all_ids | length }}
+          revisions={{ at_expected.values() | sum }}  min revision tombstones={{ at_min_revision_tombstones }}
+          excess docs={{ at_excess_ids | length }}  dataset={{ dataset_source }} ({{ at_shape_hash }})
+          v_new={{ custom_build }}
+
+
+- name: Attachments + tombstones -- step 1 -- seed or restore on 6.2 and record the baseline
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Read server version
+      ansible.builtin.uri:
+        url: "{{ base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_before
+
+    - name: Assert the node is on 6.2
+      ansible.builtin.assert:
+        that: v_before.json.FullVersion is match('^6\.2\.')
+        fail_msg: "Expected a 6.2 node, got {{ v_before.json.FullVersion }} -- install with -e rdb_version=6.2.x"
+
+    - name: Locate this dataset's snapshot folder in S3
+      ansible.builtin.set_fact:
+        dataset_node: "{{ at_node }}"
+        dataset_s3_folder: "{{ dataset_s3_prefix }}/attachments_tombstones/{{ v_before.json.FullVersion }}/{{ at_shape_hash }}"
+
+    - name: List existing snapshots (build / restore)
+      ansible.builtin.include_tasks: ../rkc-common/dataset_points.yml
+      when: dataset_source != 'seed'
+
+    - name: build -- refuse to upload a second snapshot of the same dataset
+      ansible.builtin.assert:
+        that: dataset_snapshots | length == 0
+        fail_msg: >-
+          s3://{{ dataset_s3_bucket }}/{{ dataset_s3_folder }} already holds
+          {{ dataset_snapshots | length }} snapshot(s) -- run with -e dataset_source=restore,
+          or delete the folder to rebuild.
+      when: dataset_source == 'build'
+
+    - name: restore -- a snapshot must exist
+      ansible.builtin.assert:
+        that: dataset_snapshots | length > 0
+        fail_msg: >-
+          No snapshot in s3://{{ dataset_s3_bucket }}/{{ dataset_s3_folder }} (6.2
+          {{ v_before.json.FullVersion }}, shape {{ at_shape_hash }}) -- build it first with
+          -e dataset_source=build.
+      when: dataset_source == 'restore'
+
+    - name: restore -- restore the newest snapshot as {{ at_db }}
+      ravendb_backup:
+        kind: restore
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ at_node }}"
+        backup_path: "{{ dataset_snapshots[0].location }}"
+        new_db_name: "{{ at_db }}"
+        timeout: "{{ dataset_s3_timeout_secs | int }}"
+        s3_bucket: "{{ dataset_s3_bucket }}"
+        s3_region: "{{ dataset_s3_region }}"
+        s3_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+        s3_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+        s3_session_token: "{{ lookup('env', 'AWS_SESSION_TOKEN') | default(omit, true) }}"
+      register: _restored
+      when: dataset_source == 'restore'
+
+    # Raw create (not the database module) so the record carries the tombstone setting.
+    # (A restored snapshot already carries it, plus the revisions config.)
+    - name: Create {{ at_db }} with the tombstone cleaner's timer off
+      when: dataset_source != 'restore'
+      ansible.builtin.uri:
+        url: "{{ base_url }}/admin/databases?replicationFactor=1"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body:
+          DatabaseName: "{{ at_db }}"
+          Settings:
+            Tombstones.CleanupIntervalInMin: "{{ at_tombstone_cleanup_interval_min | string }}"
+        status_code: [201]
+
+    - name: Wait for {{ at_db }} to come online
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ at_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _online
+      retries: 30
+      delay: 2
+      until: _online is succeeded
+
+    - name: restore -- remove the backup task the snapshot carries (it would pin every tombstone)
+      ansible.builtin.include_tasks: ../rkc-common/dataset_restored.yml
+      vars:
+        dataset_db: "{{ at_db }}"
+      when: dataset_source == 'restore'
+
+    - name: Configure revisions (Default keep {{ at_default_keep }}, Pruned keep {{ at_pruned_keep }})
+      when: dataset_source != 'restore'
+      ravendb_revisions:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ at_node }}"
+        db_name: "{{ at_db }}"
+        default_keep: "{{ at_default_keep | int }}"
+        default_max_age_secs: 0
+        collections_config: "{{ {'Pruned': {'keep': at_pruned_keep | int, 'max_age_secs': 0}} }}"
+
+    - name: Seed shapes
+      when: dataset_source != 'restore'
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ repo_root }}/scripts/revisions_loader.py"
+          - --target={{ at_node }}
+          - --domain={{ ravendb_domain }}
+          - --cert={{ cert_dir }}/client.pem
+          - --ca={{ cert_ca_crt }}
+          - --db={{ at_db }}
+          - --collection={{ item.collection }}
+          - --id-prefix={{ item.prefix }}
+          - --docs={{ item.docs }}
+          - --revs={{ item.revs }}
+          - --att-docs={{ item.att_docs | default(0) }}
+          - --att-every={{ item.att_every | default(0) }}
+          - --att-size={{ item.att_size | default(4096) }}
+          - --threads={{ at_loader_threads }}
+          - --batch={{ at_loader_batch }}
+      loop: "{{ at_shapes }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _seed
+      changed_when: true
+
+    - name: Loader summary
+      when: dataset_source != 'restore'
+      ansible.builtin.debug:
+        msg: "{{ _seed.results | map(attribute='stdout_lines') | map('last') | list }}"
+
+    # Lowering `keep` prunes nothing until each doc's next write, so the Excess docs enter the
+    # upgrade holding more revisions than their config allows.
+    - name: Lower Excess to keep {{ at_excess_keep }} (Pruned stays at {{ at_pruned_keep }})
+      when: dataset_source != 'restore'
+      ravendb_revisions:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ at_node }}"
+        db_name: "{{ at_db }}"
+        default_keep: "{{ at_default_keep | int }}"
+        default_max_age_secs: 0
+        collections_config: >-
+          {{ {'Pruned': {'keep': at_pruned_keep | int, 'max_age_secs': 0},
+              'Excess': {'keep': at_excess_keep | int, 'max_age_secs': 0}} }}
+
+    - name: Fingerprint every doc's revisions and read every attachment back (before)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ at_node }}"
+        db_name: "{{ at_db }}"
+        ids: "{{ at_all_ids }}"
+        verify_attachment_content: true
+      register: _fp
+
+    - name: Keep the before fingerprints
+      ansible.builtin.set_fact:
+        fp_before: "{{ _fp.fingerprints }}"
+        attachments_checked_before: "{{ _fp.attachments_checked }}"
+
+    - name: Assert exact revision count per doc on 6.2 (Excess still above its lowered keep)
+      ansible.builtin.assert:
+        that: _wrong | length == 0
+        fail_msg: "{{ _wrong | length }} doc(s) with an unexpected revision count (first 20, got != expected): {{ _wrong[:20] }}"
+      vars:
+        _wrong: >-
+          {%- set out = [] -%}
+          {%- for k, v in at_expected.items() if fp_before[k].count != v -%}
+          {%- set _ = out.append(k ~ ': ' ~ fp_before[k].count ~ ' != ' ~ v) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Read /stats (before)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ at_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_before
+
+    - name: Tombstones by kind on 6.2
+      ansible.builtin.include_tasks: ../rkc-common/tombstone_kinds.yml
+      vars: { tk_node: "{{ at_node }}", tk_db: "{{ at_db }}" }
+
+    - name: Keep them
+      ansible.builtin.set_fact:
+        kinds_before: "{{ tombstone_kinds }}"
+
+    - name: Assert doc count and that the revision tombstones are still there
+      ansible.builtin.assert:
+        that:
+          - stats_before.json.CountOfDocuments | int == at_all_ids | length
+          - stats_before.json.CountOfTombstones | int >= at_min_revision_tombstones | int
+          - kinds_before.revisions | int >= at_min_revision_tombstones | int
+          - kinds_before.total | int == stats_before.json.CountOfTombstones | int
+        fail_msg: >-
+          docs {{ stats_before.json.CountOfDocuments }} (expected {{ at_all_ids | length }}),
+          tombstones {{ stats_before.json.CountOfTombstones }} (expected >= {{ at_min_revision_tombstones }} --
+          if lower, the tombstone cleaner ran despite Tombstones.CleanupIntervalInMin); by kind {{ kinds_before }}
+
+    - name: Baseline summary
+      ansible.builtin.debug:
+        msg:
+          - "version          {{ v_before.json.FullVersion }}"
+          - "docs             {{ stats_before.json.CountOfDocuments }}"
+          - "revision docs    {{ stats_before.json.CountOfRevisionDocuments }}"
+          - "tombstones       {{ stats_before.json.CountOfTombstones }}: {{ kinds_before.revisions }} revision (>= {{ at_min_revision_tombstones }}), {{ kinds_before.attachments }} attachment, {{ kinds_before.documents }} document"
+          - "attachments      {{ stats_before.json.CountOfAttachments }} refs, {{ stats_before.json.CountOfUniqueAttachments }} unique, {{ attachments_checked_before }} read back"
+
+
+    # Only after every baseline assertion passed -- a snapshot of bad data must never be stored.
+    - name: build -- upload a snapshot of {{ at_db }} to S3
+      ravendb_backup:
+        kind: backup
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ at_node }}"
+        db_name: "{{ at_db }}"
+        backup_type: Snapshot
+        timeout: "{{ dataset_s3_timeout_secs | int }}"
+        s3_bucket: "{{ dataset_s3_bucket }}"
+        s3_region: "{{ dataset_s3_region }}"
+        s3_folder: "{{ dataset_s3_folder }}"
+        s3_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+        s3_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+        s3_session_token: "{{ lookup('env', 'AWS_SESSION_TOKEN') | default(omit, true) }}"
+      register: _uploaded
+      when: dataset_source == 'build'
+
+    - name: build -- confirm the snapshot is listed
+      ansible.builtin.include_tasks: ../rkc-common/dataset_points.yml
+      when: dataset_source == 'build'
+
+    - name: build -- assert exactly one snapshot now
+      ansible.builtin.assert:
+        that: dataset_snapshots | length == 1
+        fail_msg: "expected 1 snapshot in s3://{{ dataset_s3_bucket }}/{{ dataset_s3_folder }}, found {{ dataset_snapshots | length }}"
+      when: dataset_source == 'build'
+
+    - name: Dataset source
+      ansible.builtin.debug:
+        msg: >-
+          {{ {'seed': 'seeded with the loader (no snapshot)',
+              'build': 'seeded and uploaded: ' ~ (_uploaded.msg | default('')),
+              'restore': 'restored: ' ~ (_restored.msg | default(''))}[dataset_source] }}
+
+    # -e dataset_build_only=true: stop once the snapshot is safely in S3 (short run, less exposed
+    # to the machine restarting); test later with -e dataset_source=restore.
+    - name: build only -- stop here?
+      ansible.builtin.set_fact:
+        stop_after_build: "{{ dataset_source == 'build' and dataset_build_only | bool }}"
+
+    - name: "RESULT: dataset snapshot built -- stopping before the upgrade (build only)"
+      ansible.builtin.debug:
+        msg:
+          - "BUILT: 6.2 dataset verified and uploaded to s3://{{ dataset_s3_bucket }}/{{ dataset_s3_folder }}"
+          - "{{ _uploaded.msg | default('') }}"
+          - "Test it any time with -e dataset_source=restore (same 6.2 version and vars)."
+      when: stop_after_build | bool
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  when: not (hostvars['localhost'].stop_after_build | default(false))
+  vars:
+    # Play-level `hosts:` there is templated from `target` before vars files load; keep the
+    # default in sync with at_node in vars.yml.
+    target: "{{ at_node | default('1a') }}"
+
+
+# Two different processes, never confuse them:
+#   key cleanup       -- this PR's one-time migration of revision keys, runs on first db load
+#                        after the upgrade; visible only in the log ("... progress", "... is done").
+#   tombstone cleaner -- RavenDB's periodic tombstone purge (also in 6.2).  Must keep revision
+#                        tombstones while the key cleanup runs and may delete them after.  Its
+#                        timer is off for this db, so the scenario triggers it by hand.
+
+- name: Attachments + tombstones -- step 3 -- load db and wait for the key cleanup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: build only -- nothing to do
+      ansible.builtin.meta: end_play
+      when: hostvars['localhost'].stop_after_build | default(false)
+
+    - name: Read server version (after upgrade)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_after
+
+    - name: Assert the version changed
+      ansible.builtin.assert:
+        that: v_after.json.FullVersion != v_before.json.FullVersion
+        fail_msg: "still on {{ v_after.json.FullVersion }} -- the upgrade did not install custom_build"
+
+    - name: Run the key cleanup (and the tombstone cleaner during it)
+      ansible.builtin.include_tasks: ../rkc-common/run_key_cleanup.yml
+      vars:
+        kc_node: "{{ at_node }}"
+        kc_db: "{{ at_db }}"
+        kc_cleaner_during: "{{ at_cleaner_during }}"
+        kc_revision_tombstones_before: "{{ kinds_before.revisions }}"
+
+
+- name: Attachments + tombstones -- step 4 -- verify data after the key cleanup, then run the tombstone cleaner
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: build only -- nothing to do
+      ansible.builtin.meta: end_play
+      when: hostvars['localhost'].stop_after_build | default(false)
+
+    - name: Fingerprint every doc's revisions and read every attachment back (after)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ at_node }}"
+        db_name: "{{ at_db }}"
+        ids: "{{ at_all_ids }}"
+        verify_attachment_content: true
+      register: _fp_after
+
+    # Also proves the key cleanup did not prune: Excess docs still hold more than their keep.
+    - name: Assert every doc's revisions unchanged
+      ansible.builtin.assert:
+        that: _diff | length == 0
+        fail_msg: "{{ _diff | length }} doc(s) changed (first 20, before -> after): {{ _diff[:20] }}"
+      vars:
+        _diff: >-
+          {%- set out = [] -%}
+          {%- for k, v in fp_before.items() if _fp_after.fingerprints[k] != v -%}
+          {%- set _ = out.append(k ~ ': ' ~ v.count ~ ' -> ' ~ _fp_after.fingerprints[k].count ~
+                ('' if v.count != _fp_after.fingerprints[k].count else ' (same count, content/attachments differ)')) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Assert Excess docs were not pruned by the key cleanup
+      ansible.builtin.assert:
+        that: _pruned | length == 0
+        fail_msg: >-
+          {{ _pruned | length }} Excess doc(s) were cut back without a write (first 20, got -> expected):
+          {{ _pruned[:20] }}
+      vars:
+        _pruned: >-
+          {%- set out = [] -%}
+          {%- for k in at_excess_ids if _fp_after.fingerprints[k].count != at_expected[k] -%}
+          {%- set _ = out.append(k ~ ': ' ~ _fp_after.fingerprints[k].count ~ ' -> ' ~ at_expected[k]) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Assert every attachment was read back again
+      ansible.builtin.assert:
+        that: _fp_after.attachments_checked | int == attachments_checked_before | int
+        fail_msg: "read back {{ _fp_after.attachments_checked }} attachments, expected {{ attachments_checked_before }}"
+
+    - name: Read /stats (after the key cleanup)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ at_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_after
+
+    - name: Assert doc count unchanged
+      ansible.builtin.assert:
+        that: stats_after.json.CountOfDocuments | int == stats_before.json.CountOfDocuments | int
+        fail_msg: "docs {{ stats_before.json.CountOfDocuments }} -> {{ stats_after.json.CountOfDocuments }}"
+
+    # The key cleanup deletes no tombstone; the tombstone cleaner, if it ran during the cleanup, may
+    # have deleted the NON-revision ones (DEV).  So: revision tombstones exactly as on 6.2, and the
+    # total down by exactly what that run deleted.
+    - name: Tombstones by kind after the key cleanup
+      ansible.builtin.include_tasks: ../rkc-common/tombstone_kinds.yml
+      vars: { tk_node: "{{ at_node }}", tk_db: "{{ at_db }}" }
+
+    - name: Assert revision tombstones unchanged; others down only by what the cleaner deleted during it
+      ansible.builtin.assert:
+        that:
+          - tombstone_kinds.revisions | int == kinds_before.revisions | int
+          - stats_after.json.CountOfTombstones | int == (stats_before.json.CountOfTombstones | int) - (_deleted_during | int)
+          - tombstone_kinds.total | int == stats_after.json.CountOfTombstones | int
+        fail_msg: >-
+          tombstones by kind {{ kinds_before }} -> {{ tombstone_kinds }}; total {{ stats_before.json.CountOfTombstones }}
+          -> {{ stats_after.json.CountOfTombstones }}, the cleaner deleted {{ _deleted_during }} during the key cleanup
+      vars:
+        _deleted_during: "{{ (cleaner_during | default({})).deleted | default(0) }}"
+
+    - name: No orphan revisions
+      ravendb_diagnostic:
+        kind: orphan_revisions
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        db_name: "{{ at_db }}"
+        nodes: ["{{ at_node }}"]
+        assert_mode: true
+      register: _orphans
+
+    # The key cleanup is done, so the tombstone cleaner may now delete every revision tombstone
+    # (and the attachment tombstones left by pruned revisions).  Nothing else consumes this db.
+    - name: Run the tombstone cleaner by hand
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ at_db }}/admin/tombstones/cleanup"
+        method: POST
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _cleaner
+
+    - name: Read /stats (after the tombstone cleaner)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ at_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_cleaned
+
+    - name: Read the tombstone cleaner's state (for the failure message)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ at_db }}/admin/tombstones/state"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _tomb_state
+      when: stats_cleaned.json.CountOfTombstones | int != 0
+
+    - name: Assert the tombstone cleaner deleted every tombstone
+      ansible.builtin.assert:
+        that:
+          - stats_cleaned.json.CountOfTombstones | int == 0
+          - _cleaner.json.Value | int == stats_after.json.CountOfTombstones | int
+        fail_msg: >-
+          tombstone cleaner deleted {{ _cleaner.json.Value }} of {{ stats_after.json.CountOfTombstones }},
+          {{ stats_cleaned.json.CountOfTombstones }} left.  Cleaner state:
+          {{ (_tomb_state.json | default({})).Results | default([]) | selectattr('Documents.Component', 'ne', none) | list }}
+
+    - name: Count key-cleanup log lines before the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ at_node }}"
+
+    - name: Keep the count from before the restart
+      ansible.builtin.set_fact:
+        lines_before_restart: "{{ cleanup_line_count }}"
+
+    - name: Post-key-cleanup summary
+      ansible.builtin.debug:
+        msg:
+          - "version          {{ v_before.json.FullVersion }} -> {{ v_after.json.FullVersion }}"
+          - "docs             {{ stats_before.json.CountOfDocuments }} -> {{ stats_after.json.CountOfDocuments }}"
+          - "revision docs    {{ stats_before.json.CountOfRevisionDocuments }} -> {{ stats_after.json.CountOfRevisionDocuments }}"
+          - "tombstones       {{ stats_before.json.CountOfTombstones }} -> {{ stats_after.json.CountOfTombstones }} (key cleanup) -> {{ stats_cleaned.json.CountOfTombstones }} (tombstone cleaner deleted {{ _cleaner.json.Value }})"
+          - "attachments      {{ stats_before.json.CountOfAttachments }} -> {{ stats_after.json.CountOfAttachments }} refs, {{ _fp_after.attachments_checked }} read back"
+          - "{{ _orphans.msg }}"
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/restart_ravendb.yml
+  when: not (hostvars['localhost'].stop_after_build | default(false))
+  vars:
+    target: "{{ at_node | default('1a') }}"
+
+- name: Attachments + tombstones -- step 5 -- the key cleanup must not run again after restart
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: build only -- nothing to do
+      ansible.builtin.meta: end_play
+      when: hostvars['localhost'].stop_after_build | default(false)
+
+    - name: Load {{ at_db }} again
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ at_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _reload
+      retries: 30
+      delay: 2
+      until: _reload is succeeded
+
+    - name: Watch the log for {{ rerun_quiet_secs }}s
+      ansible.builtin.pause:
+        seconds: "{{ rerun_quiet_secs | int }}"
+
+    - name: Count key-cleanup log lines after the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ at_node }}"
+
+    - name: Assert no new key-cleanup lines
+      ansible.builtin.assert:
+        that: cleanup_line_count | int == lines_before_restart | int
+        fail_msg: >-
+          key cleanup ran again after restart: {{ lines_before_restart }} ->
+          {{ cleanup_line_count }} cleanup log lines
+
+    - name: Fingerprint again (after restart)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ at_node }}"
+        db_name: "{{ at_db }}"
+        ids: "{{ at_all_ids }}"
+      register: _fp_restart
+
+    - name: Assert revisions still unchanged
+      ansible.builtin.assert:
+        that: _fp_restart.fingerprints == fp_before
+        fail_msg: "revision fingerprints changed after restart"
+
+
+# Pruning is deferred until a doc's NEXT write.  One write per Pruned/Excess doc must cut it back
+# to exactly `keep`, leaving one revision tombstone per revision cut.
+
+- name: Attachments + tombstones -- step 6 -- next write prunes back to keep
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: build only -- nothing to do
+      ansible.builtin.meta: end_play
+      when: hostvars['localhost'].stop_after_build | default(false)
+
+    - name: Write once more to every Pruned and Excess doc
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ at_db }}/docs?id={{ item.key | urlencode }}"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body:
+          v: next-write
+          "@metadata": { "@collection": "{{ item.value.collection }}" }
+        status_code: [201]
+      loop: "{{ at_limited | dict2items }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    - name: Fingerprint the written docs
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ at_node }}"
+        db_name: "{{ at_db }}"
+        ids: "{{ at_limited.keys() | list }}"
+      register: _fp_written
+
+    - name: Assert every written doc is back to exactly keep
+      ansible.builtin.assert:
+        that: _wrong | length == 0
+        fail_msg: "{{ _wrong | length }} doc(s) not at keep after the next write (first 20, got != keep): {{ _wrong[:20] }}"
+      vars:
+        _wrong: >-
+          {%- set out = [] -%}
+          {%- for k, v in at_limited.items() if _fp_written.fingerprints[k].count != v.keep -%}
+          {%- set _ = out.append(k ~ ': ' ~ _fp_written.fingerprints[k].count ~ ' != ' ~ v.keep) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Read /stats (after the next write)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ at_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_written
+
+    # The tombstone cleaner left 0, so every tombstone now comes from this write's pruning.
+    # Lower bound: attachment references dropped with pruned revisions add a few more.
+    - name: Assert the pruning left its revision tombstones
+      ansible.builtin.assert:
+        that: stats_written.json.CountOfTombstones | int >= at_min_tombstones_after_write | int
+        fail_msg: >-
+          tombstones {{ stats_written.json.CountOfTombstones }} after the next write,
+          expected >= {{ at_min_tombstones_after_write }}
+
+    - name: "RESULT: revisions key cleanup with attachments and tombstones -- PASSED"
+      ansible.builtin.debug:
+        msg:
+          - "PASSED: revisions key cleanup on revisions with attachments + revision tombstones, upgraded in place {{ v_before.json.FullVersion }} -> {{ v_after.json.FullVersion }}"
+          - "Dataset:  {{ at_all_ids | length }} docs, {{ stats_before.json.CountOfRevisionDocuments }} revisions, {{ stats_before.json.CountOfTombstones }} tombstones, {{ stats_before.json.CountOfUniqueAttachments }} attachments ({{ dataset_source }})"
+          - "Key cleanup ran: {% set l = cleanup_lines.stdout_lines | default([]) | sort -%}{{ (l | first)[:19] ~ ' -> ' ~ (l | last)[:19] ~ ' UTC' if l else 'no log lines' }}"
+          - "OK  every doc's revisions unchanged (count, content, attachment refs); all {{ attachments_checked_before }} attachments read back intact"
+          - "OK  all {{ kinds_before.revisions }} revision tombstones kept through the key cleanup; the tombstone cleaner {{ ('ran during it and deleted ' ~ cleaner_during.deleted ~ ' non-revision tombstones only') if (cleaner_during | default({})).outcome | default('') == 'TRIGGERED' else 'was not run during it (at_cleaner_during=' ~ at_cleaner_during ~ ')' }}, then deleted all {{ _cleaner.json.Value | default('?') }} left once it was done"
+          - "OK  the key cleanup did not prune: {{ at_excess_ids | length }} docs kept more revisions than their config allows until their next write"
+          - "OK  no orphan revisions; the key cleanup did not run again after a restart"
+          - "OK  pruning resumed on the next write ({{ at_limited | length }} docs back to exactly their keep)"

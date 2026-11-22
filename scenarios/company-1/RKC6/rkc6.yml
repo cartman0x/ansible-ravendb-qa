@@ -1,0 +1,571 @@
+##################################################################################################
+# scenarios/company-1/RKC6/rkc6.yml -- restart the server in the MIDDLE of the revisions key
+# cleanup: it must continue from where it stopped, not start over.  6.2 -> v_new, ONE node,
+# small dataset (minutes).
+#
+# How "continued, not started over" is proven (scripts/cleanup_resume.py): across all restarts the
+# position (document / step / cursor) never goes back, and LastRawEtag is the same on every
+# progress line -- a cleanup that started over would take the db's last etag again, which the
+# marker document written just before each restart raised.
+#
+# Docker mode only (log reads and the trigger use `docker exec`).
+#
+# RUN (builds a fresh 1-node lab on 6.2 first -- it TEARS DOWN the lab, see run.sh):
+#   scenarios/company-1/RKC6/run.sh 6.2.20 builds/raven-prNNN.deb
+#
+# RUN (lab already on 6.2)
+#   ansible-playbook scenarios/company-1/RKC6/rkc6.yml -K \
+#       -e custom_build=$PWD/builds/raven-prNNN.deb --skip-tags download
+##################################################################################################
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/_internal/ensure_ravendb_venv.yml
+
+
+# ----- pre: validate inputs, compute ids and expectations -------------------------------------------
+
+- name: Resume -- pre -- validate inputs and show plan
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - custom_build is defined
+          - custom_build is match('^https?://') or custom_build is file
+          - "'download' in ansible_skip_tags"
+          - target_mode | default('docker') == 'docker'
+          - rr_shapes | map(attribute='revs') | map('int') | max < rr_default_keep | int
+          - rr_restarts | length > 0
+          - rr_restarts | map(attribute='phase') | difference(['documents', 'tombstones']) | length == 0
+          - rr_restarts | map(attribute='how') | difference(['restart', 'kill']) | length == 0
+        fail_msg: >-
+          Required: -e custom_build=<path or URL to the v_new .deb> AND --skip-tags download.
+          Docker mode only.  rr_default_keep must exceed every shape's revs.  Each rr_restarts
+          entry needs phase documents|tombstones and how restart|kill.
+
+    - name: Compute ids and expected revision counts
+      ansible.builtin.set_fact:
+        base_url: "https://{{ rr_node }}.{{ ravendb_domain }}:443"
+        repo_root: "{{ playbook_dir }}/../../.."
+        rr_expected: >-
+          {%- set out = {} -%}
+          {%- for s in rr_shapes -%}
+          {%- for n in range(s.docs | int) -%}
+          {%- set with_att = n < s.att_docs | default(0) | int and s.att_every | default(0) | int > 0 -%}
+          {%- set total = s.revs | int + ((s.revs | int // s.att_every | int) if with_att else 0) -%}
+          {%- set _ = out.update({s.prefix ~ '/' ~ n:
+                ([total, rr_pruned_keep | int] | min) if s.collection == 'Pruned' else total}) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+        rr_min_revision_tombstones: >-
+          {%- set acc = [] -%}
+          {%- for s in rr_shapes if s.collection == 'Pruned' -%}
+          {%- for n in range(s.docs | int) -%}
+          {%- set with_att = n < s.att_docs | default(0) | int and s.att_every | default(0) | int > 0 -%}
+          {%- set total = s.revs | int + ((s.revs | int // s.att_every | int) if with_att else 0) -%}
+          {%- set _ = acc.append([total - rr_pruned_keep | int, 0] | max) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ acc | sum }}
+        # name:phase:after:how -- the arguments of restart_trigger.sh
+        rr_points: >-
+          {{ rr_restarts | map(attribute='name') | zip(rr_restarts | map(attribute='phase'),
+             rr_restarts | map(attribute='after_lines'), rr_restarts | map(attribute='how'))
+             | map('join', ':') | list }}
+
+    - name: Keep the id list
+      ansible.builtin.set_fact:
+        rr_all_ids: "{{ rr_expected.keys() | list }}"
+
+    - name: Show plan
+      ansible.builtin.debug:
+        msg: >-
+          Plan -- restart in the middle of the key cleanup:  node={{ rr_node }}  db={{ rr_db }}
+          docs={{ rr_all_ids | length }}  revisions={{ rr_expected.values() | sum }}
+          min revision tombstones={{ rr_min_revision_tombstones }}
+          restarts={{ rr_points }}  v_new={{ custom_build }}
+
+
+# ----- step 1: seed on 6.2 and take the baseline ----------------------------------------------------
+
+- name: Resume -- step 1 -- seed on 6.2 and record the baseline
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Read server version
+      ansible.builtin.uri:
+        url: "{{ base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_before
+
+    - name: Assert the node is on 6.2
+      ansible.builtin.assert:
+        that: v_before.json.FullVersion is match('^6\.2\.')
+        fail_msg: "Expected a 6.2 node, got {{ v_before.json.FullVersion }} -- install with -e rdb_version=6.2.x"
+
+    # Raw create (not the database module) so the record carries the tombstone setting.
+    - name: Create {{ rr_db }} with the tombstone cleaner's timer off
+      ansible.builtin.uri:
+        url: "{{ base_url }}/admin/databases?replicationFactor=1"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body:
+          DatabaseName: "{{ rr_db }}"
+          Settings:
+            Tombstones.CleanupIntervalInMin: "{{ rr_tombstone_cleanup_interval_min | string }}"
+        status_code: [201]
+
+    - name: Wait for {{ rr_db }} to come online
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ rr_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _online
+      retries: 30
+      delay: 2
+      until: _online is succeeded
+
+    - name: Configure revisions (Default keep {{ rr_default_keep }}, Pruned keep {{ rr_pruned_keep }})
+      ravendb_revisions:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ rr_node }}"
+        db_name: "{{ rr_db }}"
+        default_keep: "{{ rr_default_keep | int }}"
+        default_max_age_secs: 0
+        collections_config: "{{ {'Pruned': {'keep': rr_pruned_keep | int, 'max_age_secs': 0}} }}"
+
+    - name: Seed shapes
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ repo_root }}/scripts/revisions_loader.py"
+          - --target={{ rr_node }}
+          - --domain={{ ravendb_domain }}
+          - --cert={{ cert_dir }}/client.pem
+          - --ca={{ cert_ca_crt }}
+          - --db={{ rr_db }}
+          - --collection={{ item.collection }}
+          - --id-prefix={{ item.prefix }}
+          - --docs={{ item.docs }}
+          - --revs={{ item.revs }}
+          - --att-docs={{ item.att_docs | default(0) }}
+          - --att-every={{ item.att_every | default(0) }}
+          - --att-size={{ item.att_size | default(4096) }}
+          - --pad-bytes={{ item.pad_bytes | default(0) }}
+          - --threads={{ rr_loader_threads }}
+          - --batch={{ rr_loader_batch }}
+      loop: "{{ rr_shapes }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _seed
+      changed_when: true
+
+    - name: Loader summary
+      ansible.builtin.debug:
+        msg: "{{ _seed.results | map(attribute='stdout_lines') | map('last') | list }}"
+
+    - name: Fingerprint every doc's revisions and read every attachment back (before)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ rr_node }}"
+        db_name: "{{ rr_db }}"
+        ids: "{{ rr_all_ids }}"
+        verify_attachment_content: true
+      register: _fp
+
+    - name: Keep the before fingerprints
+      ansible.builtin.set_fact:
+        fp_before: "{{ _fp.fingerprints }}"
+        attachments_checked_before: "{{ _fp.attachments_checked }}"
+
+    - name: Assert exact revision count per doc on 6.2
+      ansible.builtin.assert:
+        that: _wrong | length == 0
+        fail_msg: "{{ _wrong | length }} doc(s) with an unexpected revision count (first 20, got != expected): {{ _wrong[:20] }}"
+      vars:
+        _wrong: >-
+          {%- set out = [] -%}
+          {%- for k, v in rr_expected.items() if fp_before[k].count != v -%}
+          {%- set _ = out.append(k ~ ': ' ~ fp_before[k].count ~ ' != ' ~ v) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Read /stats (before)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ rr_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_before
+
+    - name: Assert doc count and that the revision tombstones are still there
+      ansible.builtin.assert:
+        that:
+          - stats_before.json.CountOfDocuments | int == rr_all_ids | length
+          - stats_before.json.CountOfTombstones | int >= rr_min_revision_tombstones | int
+        fail_msg: >-
+          docs {{ stats_before.json.CountOfDocuments }} (expected {{ rr_all_ids | length }}),
+          tombstones {{ stats_before.json.CountOfTombstones }} (expected >= {{ rr_min_revision_tombstones }} --
+          if lower, the tombstone cleaner ran despite Tombstones.CleanupIntervalInMin)
+
+    - name: Baseline summary
+      ansible.builtin.debug:
+        msg:
+          - "version          {{ v_before.json.FullVersion }}"
+          - "docs             {{ stats_before.json.CountOfDocuments }}"
+          - "revision docs    {{ stats_before.json.CountOfRevisionDocuments }}"
+          - "tombstones       {{ stats_before.json.CountOfTombstones }}  (>= {{ rr_min_revision_tombstones }} revision tombstones)"
+          - "attachments      {{ stats_before.json.CountOfAttachments }} refs, {{ attachments_checked_before }} read back"
+
+
+# ----- step 2: upgrade to v_new -------------------------------------------------------------------
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  vars:
+    # Play-level `hosts:` there is templated from `target` before vars files load; keep the
+    # default in sync with rr_node in vars.yml.
+    target: "{{ rr_node | default('1a') }}"
+
+
+# ----- step 3: load the db, restart in the middle of the key cleanup, wait for it to finish ------
+
+- name: Resume -- step 3 -- restart in the middle of the key cleanup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  vars:
+    rr_load_timeout_secs: 600
+    rr_trigger_secs: "{{ rr_load_timeout_secs + (rr_restart_timeout_secs | int) }}"
+    # same selection + order as restart_trigger.sh, so its line counts split these lines
+    rr_lines_cmd: >-
+      docker exec {{ rr_node }} sh -c
+      "grep -rhiF -- 'revisions key cleanup' {{ log_dir }} 2>/dev/null | grep -F '|{{ rr_db }}|' | LC_ALL=C sort"
+  tasks:
+    - name: Read server version (after upgrade)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_after
+      retries: 30
+      delay: 2
+      until: v_after is succeeded
+
+    - name: Assert the version changed
+      ansible.builtin.assert:
+        that: v_after.json.FullVersion != v_before.json.FullVersion
+        fail_msg: "still on {{ v_after.json.FullVersion }} -- the upgrade did not install custom_build"
+
+    # Not `docker cp` into /tmp: systemd mounts a tmpfs on the container's /tmp, and docker cp
+    # writes to the layer underneath it, where nothing inside the container can see the file.
+    - name: Copy the restart trigger into {{ rr_node }}
+      ansible.builtin.shell: >-
+        docker exec -i {{ rr_node }} sh -c 'cat > /root/rkc6_restart_trigger.sh'
+        < {{ playbook_dir }}/restart_trigger.sh
+        && docker exec {{ rr_node }} test -s /root/rkc6_restart_trigger.sh
+      changed_when: false
+
+    # The server loaded the db at startup, so the cleanup may already be running; the trigger
+    # counts progress lines since the server came up, so it still sees every restart point.
+    - name: Arm the restart trigger ({{ rr_points | join(', ') }})
+      ansible.builtin.command:
+        argv: "{{ ['docker', 'exec', rr_node, 'sh', '/root/rkc6_restart_trigger.sh', rr_db, log_dir,
+                   rr_trigger_secs | string] + rr_points }}"
+      async: "{{ (rr_trigger_secs | int) + 120 }}"
+      poll: 0
+      register: _trigger_job
+      changed_when: false
+
+    - name: Load {{ rr_db }} (first access starts the key cleanup)
+      ansible.builtin.shell: |
+        start=$(date +%s); end=$((start + {{ rr_load_timeout_secs }})); last=none
+        while [ $(date +%s) -lt $end ]; do
+          last=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 \
+                   --cert {{ cert_dir }}/client.pem --cacert {{ cert_ca_crt }} \
+                   {{ base_url }}/databases/{{ rr_db }}/stats) || true
+          if [ "$last" = 200 ]; then echo "LOADED_AFTER_SECS=$(( $(date +%s) - start ))"; exit 0; fi
+          sleep 5
+        done
+        echo "{{ rr_db }} did not load within {{ rr_load_timeout_secs }}s (last HTTP status: $last)" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Wait for the restart trigger (live -- docker exec {{ rr_node }} sh -c 'tail -F {{ log_dir }}/* | grep --line-buffered "{{ cleanup_any_pattern }}"')
+      ansible.builtin.async_status:
+        jid: "{{ _trigger_job.ansible_job_id }}"
+      register: _trigger
+      until: _trigger.finished
+      retries: "{{ ((rr_trigger_secs | int) + 120) // 5 }}"
+      delay: 5
+
+    - name: Parse the restart points
+      ansible.builtin.set_fact:
+        rr_done_points: >-
+          {%- set out = [] -%}
+          {%- for line in _trigger.stdout_lines if line.startswith('POINT ') -%}
+          {%- set p = {} -%}
+          {%- for kv in line.split(' ')[1:] if '=' in kv -%}
+          {%- set _ = p.update({kv.split('=', 1)[0]: kv.split('=', 1)[1]}) -%}
+          {%- endfor -%}
+          {%- set _ = out.append(p) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Restart points
+      ansible.builtin.debug:
+        msg: "{{ rr_done_points }}"
+
+    - name: Assert every restart point was hit
+      ansible.builtin.assert:
+        that:
+          - rr_done_points | length == rr_restarts | length
+          - rr_done_points | selectattr('outcome', '!=', 'RESTARTED') | list | length == 0
+          - rr_done_points | selectattr('marker', '!=', '201') | list | length == 0
+        fail_msg: >-
+          Restart trigger: {{ _trigger.stdout_lines }} {{ _trigger.stderr_lines | default([]) }}.
+          MISSED = the key cleanup finished before that point (enlarge the plain / pruned shapes,
+          or lower after_lines); TIMEOUT = no matching progress line in time; marker != 201 = the
+          marker write failed (then the LastRawEtag check proves nothing).
+
+    - name: Wait for "{{ cleanup_done_pattern }}" for {{ rr_db }}
+      ansible.builtin.shell: |
+        end=$(( $(date +%s) + {{ cleanup_timeout_secs | int }} ))
+        while [ $(date +%s) -lt $end ]; do
+          {{ rr_lines_cmd }} | grep -qF '{{ cleanup_done_pattern }}' && exit 0
+          sleep 5
+        done
+        echo "no '{{ cleanup_done_pattern }}' for {{ rr_db }} within {{ cleanup_timeout_secs }}s" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Check the progress lines -- continued, not started over
+      ansible.builtin.shell: >-
+        {{ rr_lines_cmd }} |
+        {{ ansible_playbook_python }} {{ repo_root }}/scripts/cleanup_resume.py
+        {% for p in rr_done_points %}--restart {{ p.c_restart }}:{{ p.c_up }} {% endfor %}
+        {{ '--allow-shutdown-errors' if rr_allow_shutdown_errors | bool else '' }}
+      register: _resume
+      changed_when: false
+      failed_when: _resume.rc not in [0, 1]
+
+    - name: Keep the resume report
+      ansible.builtin.set_fact:
+        rr_resume: "{{ _resume.stdout | from_json }}"
+
+    - name: Progress lines around each restart
+      ansible.builtin.debug:
+        msg: >-
+          {%- set out = [] -%}
+          {%- for r in rr_resume.restarts -%}
+          {%- set p = rr_done_points[loop.index0] -%}
+          {%- set _ = out.extend([
+                'restart ' ~ r.restart ~ ' (' ~ p.name ~ ', ' ~ p.how ~ '):',
+                '  last before  ' ~ r.last_before,
+                '  first after  ' ~ r.first_after,
+                '  ' ~ ('resumed at the same position' if r.same_position else 'resumed further on') ~
+                  ', LastRawEtag ' ~ r.last_raw_etag_before ~ ' -> ' ~ r.last_raw_etag_after]) -%}
+          {%- endfor -%}
+          {%- set _ = out.append(rr_resume.progress_lines ~ ' progress lines, LastRawEtag ' ~ rr_resume.last_raw_etags) -%}
+          {%- if rr_resume.shutdown_errors -%}
+          {%- set _ = out.append('error line(s) while the server shut down (allowed): ' ~ rr_resume.shutdown_errors) -%}
+          {%- endif -%}
+          {{ out }}
+
+    - name: Assert the key cleanup continued after every restart
+      ansible.builtin.assert:
+        that: rr_resume.ok
+        fail_msg: "{{ rr_resume.problems }}"
+
+
+# ----- step 4: verify data, then run the tombstone cleaner ------------------------------------------
+
+- name: Resume -- step 4 -- verify data after the key cleanup, then run the tombstone cleaner
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Fingerprint every doc's revisions and read every attachment back (after)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ rr_node }}"
+        db_name: "{{ rr_db }}"
+        ids: "{{ rr_all_ids }}"
+        verify_attachment_content: true
+      register: _fp_after
+
+    - name: Assert every doc's revisions unchanged
+      ansible.builtin.assert:
+        that: _diff | length == 0
+        fail_msg: "{{ _diff | length }} doc(s) changed (first 20, before -> after): {{ _diff[:20] }}"
+      vars:
+        _diff: >-
+          {%- set out = [] -%}
+          {%- for k, v in fp_before.items() if _fp_after.fingerprints[k] != v -%}
+          {%- set _ = out.append(k ~ ': ' ~ v.count ~ ' -> ' ~ _fp_after.fingerprints[k].count ~
+                ('' if v.count != _fp_after.fingerprints[k].count else ' (same count, content/attachments differ)')) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Assert every attachment was read back again
+      ansible.builtin.assert:
+        that: _fp_after.attachments_checked | int == attachments_checked_before | int
+        fail_msg: "read back {{ _fp_after.attachments_checked }} attachments, expected {{ attachments_checked_before }}"
+
+    - name: Fingerprint the marker documents (written during the cleanup)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ rr_node }}"
+        db_name: "{{ rr_db }}"
+        ids: "{{ rr_marker_ids }}"
+      vars:
+        rr_marker_ids: "{{ rr_done_points | map(attribute='n') | map('regex_replace', '^', 'rkc6-marker/') | list }}"
+      register: _fp_markers
+
+    - name: Assert each marker has its one revision
+      ansible.builtin.assert:
+        that: _fp_markers.fingerprints.values() | map(attribute='count') | reject('equalto', 1) | list | length == 0
+        fail_msg: "marker revisions: {{ _fp_markers.fingerprints | dict2items | map(attribute='key') | zip(_fp_markers.fingerprints.values() | map(attribute='count')) | list }}"
+
+    - name: Read /stats (after the key cleanup)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ rr_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_after
+
+    - name: Assert docs = before + markers, tombstones unchanged by the key cleanup
+      ansible.builtin.assert:
+        that:
+          - stats_after.json.CountOfDocuments | int == (stats_before.json.CountOfDocuments | int) + (rr_done_points | length)
+          - stats_after.json.CountOfTombstones | int == stats_before.json.CountOfTombstones | int
+        fail_msg: >-
+          docs {{ stats_before.json.CountOfDocuments }} -> {{ stats_after.json.CountOfDocuments }}
+          (expected +{{ rr_done_points | length }} markers), tombstones
+          {{ stats_before.json.CountOfTombstones }} -> {{ stats_after.json.CountOfTombstones }}
+
+    - name: No orphan revisions
+      ravendb_diagnostic:
+        kind: orphan_revisions
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        db_name: "{{ rr_db }}"
+        nodes: ["{{ rr_node }}"]
+        assert_mode: true
+      register: _orphans
+
+    - name: Run the tombstone cleaner by hand (key cleanup is done -- it may delete everything now)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ rr_db }}/admin/tombstones/cleanup"
+        method: POST
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _cleaner
+
+    - name: Read /stats (after the tombstone cleaner)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ rr_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: stats_cleaned
+
+    - name: Assert the tombstone cleaner deleted every tombstone
+      ansible.builtin.assert:
+        that:
+          - stats_cleaned.json.CountOfTombstones | int == 0
+          - _cleaner.json.Value | int == stats_after.json.CountOfTombstones | int
+        fail_msg: >-
+          tombstone cleaner deleted {{ _cleaner.json.Value }} of {{ stats_after.json.CountOfTombstones }},
+          {{ stats_cleaned.json.CountOfTombstones }} left
+
+    - name: Count key-cleanup log lines before the final restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ rr_node }}"
+
+    - name: Keep the count from before the final restart
+      ansible.builtin.set_fact:
+        lines_before_restart: "{{ cleanup_line_count }}"
+
+
+# ----- step 5: restart after it is done, the key cleanup must not run again -------------------------
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/restart_ravendb.yml
+  vars:
+    target: "{{ rr_node | default('1a') }}"
+
+- name: Resume -- step 5 -- the key cleanup must not run again after it is done
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Load {{ rr_db }} again
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ rr_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _reload
+      retries: 30
+      delay: 2
+      until: _reload is succeeded
+
+    - name: Watch the log for {{ rerun_quiet_secs }}s
+      ansible.builtin.pause:
+        seconds: "{{ rerun_quiet_secs | int }}"
+
+    - name: Count key-cleanup log lines after the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ rr_node }}"
+
+    - name: Assert no new key-cleanup lines
+      ansible.builtin.assert:
+        that: cleanup_line_count | int == lines_before_restart | int
+        fail_msg: "key cleanup ran again after restart: {{ lines_before_restart }} -> {{ cleanup_line_count }} cleanup log lines"
+
+    - name: Fingerprint again (after restart)
+      ravendb_revisions_fingerprint:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ rr_node }}"
+        db_name: "{{ rr_db }}"
+        ids: "{{ rr_all_ids }}"
+      register: _fp_restart
+
+    - name: Assert revisions still unchanged
+      ansible.builtin.assert:
+        that: _fp_restart.fingerprints == fp_before
+        fail_msg: "revision fingerprints changed after restart"
+
+    - name: "RESULT: revisions key cleanup continues after a restart -- PASSED"
+      ansible.builtin.debug:
+        msg:
+          - "PASSED: restart in the middle of the revisions key cleanup, upgraded in place {{ v_before.json.FullVersion }} -> {{ v_after.json.FullVersion }}"
+          - "Dataset:  {{ rr_all_ids | length }} docs, {{ stats_before.json.CountOfRevisionDocuments }} revisions, {{ stats_before.json.CountOfTombstones }} tombstones, {{ attachments_checked_before }} attachments"
+          - "OK  restarted {{ rr_done_points | length }}x mid-cleanup ({{ rr_done_points | map(attribute='name') | zip(rr_done_points | map(attribute='how')) | map('join', ' by ') | join(', ') }}); each time it continued: position never went back, LastRawEtag stayed {{ rr_resume.last_raw_etags | first }}"
+          - "OK  every doc's revisions unchanged (count, content, attachment refs); all {{ attachments_checked_before }} attachments read back intact"
+          - "OK  tombstone count unchanged by the key cleanup; the tombstone cleaner deleted all {{ _cleaner.json.Value }} once it was done"
+          - "OK  no orphan revisions; the key cleanup did not run again after a restart once done"

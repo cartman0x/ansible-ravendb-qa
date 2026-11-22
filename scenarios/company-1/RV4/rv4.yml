@@ -1,0 +1,97 @@
+##################################################################################################
+# scenarios/company-1/RV4/rv4.yml
+# -- 6.2 -> 7.2 upgrade of the replication DESTINATION only, on a 2-node cluster.
+#
+# The source node (source_node, default 1a) stays on 6.2; the destination node
+# (dest_node, default 1b) is upgraded, so it receives incoming replication from an
+# older-version node.
+#
+# RUN (builds the 2-node cluster on 6.2, then this playbook):
+#   scenarios/company-1/RV4/run.sh 6.2.20 7.2.7                         # destination -> 7.2.7
+#   scenarios/company-1/RV4/run.sh 6.2.20 builds/raven-prNNN.deb        # destination -> a PR build
+#
+# RUN by hand (lab already a 2-node cluster on 6.2)
+#   ansible-playbook scenarios/company-1/RV4/rv4.yml -K
+#   # upgrade to a PR build instead of upgrade_version:
+#   ... -e custom_build=$PWD/builds/raven-prNNN.deb --skip-tags download
+#   # other direction:
+#   ... -e source_node=1b -e dest_node=1a
+###################################################################################################
+
+
+- name: validate inputs + show plan
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [vars.yml]
+  tasks:
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - source_node != dest_node
+          - custom_build is not defined or 'download' in ansible_skip_tags
+        fail_msg: >-
+          source_node and dest_node must differ; -e custom_build=... also needs --skip-tags download.
+
+    - name: Read versions before the upgrade
+      ansible.builtin.uri:
+        url: "https://{{ item }}.{{ ravendb_domain }}:443/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      loop: ["{{ source_node }}", "{{ dest_node }}"]
+      register: _v_before
+
+    - name: Keep versions before the upgrade
+      ansible.builtin.set_fact:
+        versions_before: "{{ dict(_v_before.results | map(attribute='item') | zip(_v_before.results | map(attribute='json.FullVersion'))) }}"
+
+    - name: Show plan
+      ansible.builtin.debug:
+        msg: |
+          Plan:
+            - source {{ source_node }} stays on {{ versions_before[source_node] }}
+            - upgrade ONLY destination {{ dest_node }}: {{ versions_before[dest_node] }} -> {{ custom_build | default(upgrade_version) }}
+            - run incoming replication {{ source_node }} -> {{ dest_node }}
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  vars:
+    # Play-level `hosts:` in upgrade_node.yml is templated from `target`, so it can only see
+    # extra vars and these import vars -- not vars.yml.  Keep the default in sync with vars.yml.
+    target: "{{ dest_node | default('1b') }}"
+    rdb_version: "{{ upgrade_version | default('7.2.2') }}"
+
+
+- name: verify only the destination was upgraded
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [vars.yml]
+  tasks:
+    - name: Read versions after the upgrade
+      ansible.builtin.uri:
+        url: "https://{{ item }}.{{ ravendb_domain }}:443/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      loop: ["{{ source_node }}", "{{ dest_node }}"]
+      register: _v_after
+      retries: 30
+      delay: 2
+      until: _v_after is succeeded
+
+    - name: Keep versions after the upgrade
+      ansible.builtin.set_fact:
+        versions_after: "{{ dict(_v_after.results | map(attribute='item') | zip(_v_after.results | map(attribute='json.FullVersion'))) }}"
+
+    - name: Assert source unchanged, destination upgraded
+      ansible.builtin.assert:
+        that:
+          - versions_after[source_node] == versions_before[source_node]
+          - versions_after[dest_node] != versions_before[dest_node]
+        fail_msg: >-
+          source {{ source_node }}: {{ versions_before[source_node] }} -> {{ versions_after[source_node] }},
+          dest {{ dest_node }}: {{ versions_before[dest_node] }} -> {{ versions_after[dest_node] }}
+
+
+# ---- step 2: incoming replication source -> destination ----
+# TODO: seed on source_node, wait for it to replicate to dest_node, verify.

@@ -1,0 +1,29 @@
+# scenarios/company-1/rkc-common/size_sample_stop.yml -- task file.
+# Stops the sampler size_sample_start.yml started and summarizes it per window: for every db and
+# field, first / last / peak.  Sets the fact `size_windows` ({window: {db: {field: {first, last, peak}}}}).
+# Requires: size_csv, size_windows_spec (list of "NAME:START:END", epoch seconds), repo_root.
+
+- name: Stop the size sampler
+  ansible.builtin.file:
+    path: "{{ size_csv }}.stop"
+    state: touch
+    mode: "0644"
+
+- name: Wait for it to exit
+  ansible.builtin.async_status:
+    jid: "{{ _size_job.ansible_job_id }}"
+  register: _size_bg
+  until: _size_bg.finished
+  retries: 60
+  delay: 2
+
+- name: Summarize the sizes per window
+  ansible.builtin.command:
+    argv: "{{ [ansible_playbook_python, repo_root ~ '/scripts/db_size.py', 'summarize', '--csv', size_csv]
+              + (size_windows_spec | map('regex_replace', '^', '--window=') | list) }}"
+  register: _size_sum
+  changed_when: false
+
+- name: Keep the window summary
+  ansible.builtin.set_fact:
+    size_windows: "{{ _size_sum.stdout | from_json }}"

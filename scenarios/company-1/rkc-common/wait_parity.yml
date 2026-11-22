@@ -1,0 +1,34 @@
+# scenarios/company-1/rkc-common/wait_parity.yml -- task file.
+# Waits until replication has caught up: the /stats fields in parity_fields are the same on every
+# node in parity_nodes, and stayed the same over two polls 10 s apart.
+# Requires: parity_nodes (list), parity_db, parity_fields (list of /stats field names),
+#           parity_timeout_secs.  Sets: parity_values (the matching "f1,f2,..." string).
+
+- name: Wait until {{ parity_fields | join(', ') }} match on {{ parity_nodes | join(', ') }} ({{ parity_db }})
+  ansible.builtin.shell: |
+    end=$(( $(date +%s) + {{ parity_timeout_secs | int }} )); prev=""; cur=""
+    while [ $(date +%s) -lt $end ]; do
+      cur=""
+      for n in {{ parity_nodes | join(' ') }}; do
+        v=$(curl -s --max-time 30 --cert {{ cert_dir }}/client.pem --cacert {{ cert_ca_crt }} \
+              "https://$n.{{ ravendb_domain }}:443/databases/{{ parity_db }}/stats" \
+            | python3 -c 'import json, sys; d = json.load(sys.stdin); print(",".join(str(d[f]) for f in sys.argv[1:]))' \
+                {{ parity_fields | join(' ') }} 2>/dev/null) || v=ERR
+        cur="$cur $n=${v:-ERR}"
+      done
+      distinct=$(echo $cur | tr ' ' '\n' | cut -d= -f2 | sort -u | wc -l)
+      if [ "$distinct" = 1 ] && ! echo "$cur" | grep -q ERR && [ "$cur" = "$prev" ]; then
+        echo "$cur" | tr ' ' '\n' | sed -n '2p' | cut -d= -f2; exit 0
+      fi
+      prev="$cur"; sleep 10
+    done
+    echo "replication did not catch up within {{ parity_timeout_secs }}s ({{ parity_fields | join(',') }}):$cur" >&2
+    exit 1
+  args:
+    executable: /bin/bash
+  register: _parity
+  changed_when: false
+
+- name: Keep the matching values
+  ansible.builtin.set_fact:
+    parity_values: "{{ _parity.stdout | trim }}"

@@ -1,0 +1,874 @@
+##################################################################################################
+# scenarios/company-1/RKC7/rkc7.yml -- dataset 1: a FEW documents with MILLIONS of revisions each,
+# 6.2 -> v_new, ONE node.  Full flow: seed on 6.2, upgrade, key cleanup, verify, enforce, restart.
+#
+# Sizes come from a profile in vars.yml: laptop (default, ~11M revisions) or kaiju (~105M):
+#   ... -e d1_profile=kaiju
+#
+# What it proves beyond "revisions unchanged":
+#   * the Limited doc enters the upgrade far above its keep; writes to it and an enforce WHILE the
+#     cleanup has not reached it yet (it sorts last) must NOT prune it -- pruning waits until the
+#     cleanup passed it.  Enforce after the cleanup brings it down to exactly its keep;
+#   * a write probe times user writes to THIS db during the cleanup (its batches go through the
+#     same merger); data file / journal sizes are tracked (Voron does not give space back).
+# Per doc: exact revision count plus a SAMPLE of pages (newest, oldest, evenly spaced) -- reading
+# every revision of a doc with millions is quadratic on the server.
+#
+# Report: <d1_out_dir>/rkc7-report-<v_new>.json (+ metrics.csv, probe.csv, cleanup-lines.log).
+# Docker mode only.
+#
+# RUN (builds a fresh 1-node lab on 6.2 first -- it TEARS DOWN the lab, see run.sh):
+#   scenarios/company-1/RKC7/run.sh 6.2.20 builds/raven-prNNN.deb
+#   scenarios/company-1/RKC7/run.sh 6.2.20 builds/raven-prNNN.deb -e d1_profile=kaiju
+##################################################################################################
+
+
+- ansible.builtin.import_playbook: ../../../toolbox/_internal/ensure_ravendb_venv.yml
+
+
+# ----- pre: validate inputs, pick the profile, compute expectations ---------------------------------
+
+- name: Dataset 1 -- pre -- validate inputs and show plan
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - custom_build is defined
+          - custom_build is match('^https?://') or custom_build is file
+          - "'download' in ansible_skip_tags"
+          - target_mode | default('docker') == 'docker'
+          - d1_profile in d1_profiles
+          - d1_profiles[d1_profile].shapes | selectattr('collection', '==', 'Limited') | list | length == 1
+          - (d1_profiles[d1_profile].shapes | selectattr('collection', '==', 'Limited') | first).revs > d1_limited_keep | int
+        fail_msg: >-
+          Required: -e custom_build=<v_new .deb> AND --skip-tags download, docker mode.
+          d1_profile must be one of {{ d1_profiles.keys() | list }}, with exactly one Limited shape
+          holding more revisions than d1_limited_keep.
+
+    - name: Pick the profile and compute expected counts
+      ansible.builtin.set_fact:
+        base_url: "https://{{ d1_node }}.{{ ravendb_domain }}:443"
+        repo_root: "{{ playbook_dir }}/../../.."
+        d1_shapes: "{{ d1_profiles[d1_profile].shapes }}"
+        d1_cleanup_timeout_secs: "{{ d1_profiles[d1_profile].cleanup_timeout_secs }}"
+        d1_enforce_timeout_secs: "{{ d1_profiles[d1_profile].enforce_timeout_secs }}"
+        # {id: {count, collection}} for every doc
+        d1_expected: >-
+          {%- set out = {} -%}
+          {%- for s in d1_profiles[d1_profile].shapes -%}
+          {%- set every = s.att_every | default(0) | int -%}
+          {%- for n in range(s.docs | int) -%}
+          {%- set with_att = n < s.att_docs | default(0) | int and every > 0 -%}
+          {%- set _ = out.update({s.prefix ~ '/' ~ n: {'count': s.revs + ((s.revs // every) if with_att else 0),
+                                                        'collection': s.collection}}) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Keep the id lists and totals
+      ansible.builtin.set_fact:
+        d1_all_ids: "{{ d1_expected.keys() | list }}"
+        d1_big_ids: "{{ d1_expected | dict2items | selectattr('value.collection', '==', 'Big') | map(attribute='key') | list }}"
+        d1_limited_id: "{{ d1_expected | dict2items | selectattr('value.collection', '==', 'Limited') | map(attribute='key') | first }}"
+        d1_total_revisions: "{{ d1_expected.values() | map(attribute='count') | sum }}"
+        # one distinct attachment per (doc, attachment): att_docs x (revs // att_every) per shape
+        d1_total_attachments: >-
+          {%- set acc = [] -%}
+          {%- for s in d1_shapes if s.att_every | default(0) | int > 0 -%}
+          {%- set _ = acc.append([s.att_docs | default(0) | int, s.docs | int] | min * (s.revs // s.att_every)) -%}
+          {%- endfor -%}
+          {{ acc | sum }}
+
+    - name: Show plan
+      ansible.builtin.debug:
+        msg: >-
+          Plan -- dataset 1, profile {{ d1_profile }}: {{ d1_all_ids | length }} docs, {{ d1_total_revisions }}
+          revisions ({{ d1_shapes | map(attribute='name') | zip(d1_shapes | map(attribute='docs'), d1_shapes | map(attribute='revs'))
+          | map('join', ':') | join(', ') }} as name:docs:revisions), {{ d1_total_attachments }} attachments;
+          {{ d1_limited_id }} lowered to keep {{ d1_limited_keep }} on 6.2.  db={{ d1_db }} on {{ d1_node }},
+          v_new={{ custom_build }}, report in {{ d1_out_dir }}
+
+
+# ----- step 1: seed on 6.2 and take the baseline ----------------------------------------------------
+
+- name: Dataset 1 -- step 1 -- seed on 6.2 and record the baseline
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  vars:
+    # Default unlimited; Probe (the write probe's docs, written after the upgrade) without revisions.
+    d1_revisions_config:
+      Default: { MinimumRevisionsToKeep: null, Disabled: false }
+      Collections:
+        Probe: { Disabled: true }
+  tasks:
+    - name: Read server version
+      ansible.builtin.uri:
+        url: "{{ base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_before
+
+    - name: Assert the node is on 6.2
+      ansible.builtin.assert:
+        that: v_before.json.FullVersion is match('^6\.2\.')
+        fail_msg: "Expected a 6.2 node, got {{ v_before.json.FullVersion }} -- install with -e rdb_version=6.2.x"
+
+    - name: Fresh output folder {{ d1_out_dir }}
+      ansible.builtin.file:
+        path: "{{ d1_out_dir }}"
+        state: "{{ item }}"
+        mode: "0755"
+      loop: [absent, directory]
+
+    - name: Create {{ d1_db }} with the tombstone cleaner's timer off
+      ansible.builtin.uri:
+        url: "{{ base_url }}/admin/databases?replicationFactor=1"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body:
+          DatabaseName: "{{ d1_db }}"
+          Settings: { Tombstones.CleanupIntervalInMin: "100000" }
+        status_code: [201]
+
+    - name: Wait for {{ d1_db }} to come online
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _online
+      retries: 30
+      delay: 2
+      until: _online is succeeded
+
+    - name: Configure revisions (unlimited; Probe without revisions)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/admin/revisions/config"
+        method: POST
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body: "{{ d1_revisions_config }}"
+        status_code: [200, 201]
+
+    - name: Seeding -- follow progress with `tail -F {{ d1_out_dir }}/seed.log`
+      ansible.builtin.debug:
+        msg: "{{ d1_total_revisions }} revisions, one stream per doc ({{ d1_all_ids | length }} in parallel)"
+
+    # Every shape at once, each loader with one thread per doc.
+    - name: Seed every shape
+      ansible.builtin.shell: |
+        pids=""
+        {% for s in d1_shapes %}
+        python3 "{{ repo_root }}/scripts/revisions_loader.py" \
+          --target={{ d1_node }} --domain={{ ravendb_domain }} \
+          --cert={{ cert_dir }}/client.pem --ca={{ cert_ca_crt }} --db={{ d1_db }} \
+          --collection={{ s.collection }} --id-prefix={{ s.prefix }} \
+          --docs={{ s.docs }} --revs={{ s.revs }} --pad-bytes={{ s.pad_bytes | default(0) }} \
+          --att-docs={{ s.att_docs | default(0) }} --att-every={{ s.att_every | default(0) }} \
+          --att-size={{ s.att_size | default(4096) }} \
+          --threads={{ s.docs }} --batch={{ d1_loader_batch }} --progress-secs=60 \
+          >> "{{ d1_out_dir }}/seed.log" 2>&1 &
+        pids="$pids $!"
+        {% endfor %}
+        rc=0; for p in $pids; do wait $p || rc=1; done
+        grep -E '^(DONE|FAILED)' "{{ d1_out_dir }}/seed.log"
+        exit $rc
+      args:
+        executable: /bin/bash
+      register: _seed
+      changed_when: true
+
+    - name: Loader summary
+      ansible.builtin.debug:
+        msg: "{{ _seed.stdout_lines }}"
+
+    - name: Lower Limited to keep {{ d1_limited_keep }} (nothing is pruned until the doc's next write)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/admin/revisions/config"
+        method: POST
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body: >-
+          {{ d1_revisions_config | combine({'Collections': {'Limited':
+               {'MinimumRevisionsToKeep': d1_limited_keep | int, 'Disabled': false}}}, recursive=true) }}
+        status_code: [200, 201]
+
+    - name: Sample every doc's revisions and read the sampled attachments back (before)
+      ravendb_revisions_sample:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ d1_node }}"
+        db_name: "{{ d1_db }}"
+        ids: "{{ d1_all_ids }}"
+        pages: "{{ d1_sample_pages | int }}"
+        verify_attachment_content: true
+      register: _sample
+
+    - name: Keep the before samples
+      ansible.builtin.set_fact:
+        sample_before: "{{ _sample.samples }}"
+        att_before: "{{ _sample.attachments_checked }}"
+
+    - name: Assert the exact revision count of every doc on 6.2 (the limited one above its keep)
+      ansible.builtin.assert:
+        that: _wrong | length == 0
+        fail_msg: "doc(s) with an unexpected revision count (got != expected): {{ _wrong }}"
+      vars:
+        _wrong: >-
+          {%- set out = [] -%}
+          {%- for k, v in d1_expected.items() if sample_before[k].count != v.count -%}
+          {%- set _ = out.append(k ~ ': ' ~ sample_before[k].count ~ ' != ' ~ v.count) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Read /stats (before)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 300
+      register: stats_before
+
+    - name: Assert exact totals on 6.2
+      ansible.builtin.assert:
+        that:
+          - stats_before.json.CountOfDocuments | int == d1_all_ids | length
+          - stats_before.json.CountOfRevisionDocuments | int == d1_total_revisions | int
+          - stats_before.json.CountOfUniqueAttachments | int == d1_total_attachments | int
+        fail_msg: >-
+          docs {{ stats_before.json.CountOfDocuments }} (expected {{ d1_all_ids | length }}),
+          revisions {{ stats_before.json.CountOfRevisionDocuments }} (expected {{ d1_total_revisions }}),
+          unique attachments {{ stats_before.json.CountOfUniqueAttachments }} (expected {{ d1_total_attachments }})
+
+    - name: Baseline summary
+      ansible.builtin.debug:
+        msg:
+          - "version          {{ v_before.json.FullVersion }}"
+          - "docs             {{ stats_before.json.CountOfDocuments }}"
+          - "revisions        {{ stats_before.json.CountOfRevisionDocuments }}  ({{ d1_limited_id }}: {{ sample_before[d1_limited_id].count }}, keep {{ d1_limited_keep }})"
+          - "tombstones       {{ stats_before.json.CountOfTombstones }}"
+          - "attachments      {{ stats_before.json.CountOfUniqueAttachments }} unique, {{ stats_before.json.CountOfAttachments }} refs, {{ att_before }} read back"
+
+    - name: Data file + journal sizes on 6.2
+      ansible.builtin.include_tasks: ../rkc-common/size_snapshot.yml
+      vars: { size_node: "{{ d1_node }}", size_dbs: ["{{ d1_db }}"], size_label: "on 6.2 (seeded)" }
+
+
+# ----- step 2: upgrade to v_new -------------------------------------------------------------------
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/upgrade_node.yml
+  vars:
+    # Play-level `hosts:` there is templated from `target` before vars files load; keep the
+    # default in sync with d1_node in vars.yml.
+    target: "{{ d1_node | default('1a') }}"
+
+
+# ----- step 3: the key cleanup, measured, with writes + enforce while it runs ------------------------
+
+- name: Dataset 1 -- step 3 -- the key cleanup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  vars:
+    d1_bg_secs: >-
+      {{ (d1_idle_secs | int) + (d1_load_timeout_secs | int) + (d1_cleanup_timeout_secs | int)
+         + (d1_after_secs | int) + 600 }}
+    _m: "{{ d1_out_dir }}/metrics"
+    _p: "{{ d1_out_dir }}/probe"
+    # every cleanup line of the db, in time order (-i: the error line says "revisions key cleanup")
+    d1_lines_cmd: >-
+      docker exec {{ d1_node }} sh -c
+      "grep -rhiF -- 'revisions key cleanup' {{ log_dir }} 2>/dev/null | grep -F '|{{ d1_db }}|' | LC_ALL=C sort"
+  tasks:
+    - name: Read server version (after upgrade)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/build/version"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: v_after
+      retries: 30
+      delay: 2
+      until: v_after is succeeded
+
+    - name: Assert the version changed
+      ansible.builtin.assert:
+        that: v_after.json.FullVersion != v_before.json.FullVersion
+        fail_msg: "still on {{ v_after.json.FullVersion }} -- the upgrade did not install custom_build"
+
+    - name: Start the size sampler (data file + journals)
+      ansible.builtin.include_tasks: ../rkc-common/size_sample_start.yml
+      vars:
+        size_node: "{{ d1_node }}"
+        size_dbs: ["{{ d1_db }}"]
+        size_csv: "{{ d1_out_dir }}/sizes.csv"
+        size_max_secs: "{{ d1_bg_secs }}"
+        size_interval_secs: "{{ d1_size_interval_secs }}"
+
+    - name: Start the metrics sampler (CPU, memory, disk I/O of {{ d1_node }}, every {{ d1_sample_interval_secs }}s)
+      ansible.builtin.command:
+        argv: [python3, "{{ repo_root }}/scripts/container_metrics.py", sample, --container, "{{ d1_node }}",
+               --interval, "{{ d1_sample_interval_secs | string }}", --out, "{{ _m }}.csv",
+               --stop-file, "{{ _m }}.stop", --max-secs, "{{ d1_bg_secs | string }}"]
+      async: "{{ d1_bg_secs | int + 60 }}"
+      poll: 0
+      register: _sampler
+      changed_when: false
+
+    - name: Idle window starts
+      ansible.builtin.set_fact:
+        t_idle: "{{ lookup('pipe', 'date +%s.%N') }}"
+
+    # Not idle: the server loaded {{ d1_db }} at startup, so this window holds its schema upgrade
+    # and the cleanup's first seconds.  Kept for comparison; the baseline is the after window.
+    - name: Idle window -- {{ d1_idle_secs }}s right after the upgrade (the cleanup is already running)
+      ansible.builtin.pause:
+        seconds: "{{ d1_idle_secs | int }}"
+
+    - name: Cleanup window starts
+      ansible.builtin.set_fact:
+        t_load: "{{ lookup('pipe', 'date +%s.%N') }}"
+
+    # The server started loading {{ d1_db }} at startup (the schema upgrade keeps it offline) and
+    # the cleanup starts once it is loaded.  This only waits until it answers, so a db that fails to
+    # load stops the test here, not as a cleanup timeout.
+    - name: Wait until {{ d1_db }} is online (loaded by the server at startup)
+      ansible.builtin.shell: |
+        start=$(date +%s); end=$((start + {{ d1_load_timeout_secs | int }})); last=none
+        while [ $(date +%s) -lt $end ]; do
+          last=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 \
+                   --cert {{ cert_dir }}/client.pem --cacert {{ cert_ca_crt }} \
+                   {{ base_url }}/databases/{{ d1_db }}/stats) || true
+          if [ "$last" = 200 ]; then echo "$(( $(date +%s) - start ))"; exit 0; fi
+          sleep 5
+        done
+        echo "{{ d1_db }} did not load within {{ d1_load_timeout_secs }}s (last HTTP status: $last)" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: _load
+      changed_when: false
+
+    - name: Start the write probe on {{ d1_db }} itself (collection Probe, revisions off)
+      ansible.builtin.include_tasks: ../rkc-common/probe_start.yml
+      vars:
+        probe_node: "{{ d1_node }}"
+        probe_db: "{{ d1_db }}"
+        probe_csv: "{{ _p }}.csv"
+        probe_interval_secs: "{{ d1_probe_interval_secs }}"
+        probe_max_secs: "{{ d1_bg_secs }}"
+
+    # ---- while the cleanup walks the big docs: writes + enforce on the limited doc ----------------
+
+    - name: Wait for the cleanup's first progress line
+      ansible.builtin.shell: |
+        for i in $(seq 1 600); do
+          {{ d1_lines_cmd }} | grep -qF '{{ cleanup_progress_pattern }}' && exit 0
+          sleep 1
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Write {{ d1_writes_during }} times to {{ d1_limited_id }} while the cleanup has not reached it
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/docs?id={{ d1_limited_id | urlencode }}"
+        method: PUT
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body: { v: "during-{{ item }}", "@metadata": { "@collection": "Limited" } }
+        status_code: [201]
+      loop: "{{ range(1, (d1_writes_during | int) + 1) | list }}"
+
+    - name: Count the limited doc's revisions after the writes
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/revisions?id={{ d1_limited_id | urlencode }}&pageSize=1"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _lim_written
+
+    - name: Enforce the revisions configuration while the cleanup runs
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/admin/revisions/config/enforce"
+        method: POST
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body: { IncludeForceCreated: false }
+      register: _enf_during
+
+    - name: Wait for that enforce operation
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/operations/state?id={{ _enf_during.json.OperationId }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _enf_during_state
+      until: _enf_during_state.json.Status | default('') in ['Completed', 'Faulted', 'Canceled']
+      retries: "{{ (d1_enforce_timeout_secs | int) // 5 }}"
+      delay: 5
+
+    - name: Count the limited doc's revisions after that enforce
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/revisions?id={{ d1_limited_id | urlencode }}&pageSize=1"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _lim_enforced
+
+    # The checks above only mean something if the cleanup had not reached the limited doc yet.
+    - name: Where is the cleanup now?
+      ansible.builtin.shell: "{{ d1_lines_cmd }} | tail -1"
+      register: _now_line
+      changed_when: false
+
+    # The documents phase walks ids in byte order; the limited doc sorts after every big doc.
+    - name: Keep where it was
+      ansible.builtin.set_fact:
+        # regex_findall, not regex_search(.., '\\1'): that one crashes on a line that does not match
+        _now_step: "{{ _now_line.stdout | regex_findall('progress: step ([A-Za-z]+),') | first | default('') }}"
+        _now_doc: >-
+          {{ _now_line.stdout | regex_findall("document '([^']*)'") | first | default('') | regex_replace('[\x00-\x1f].*$', '') }}
+
+    - name: Was it still before the limited doc?
+      ansible.builtin.set_fact:
+        during_checked_in_time: >-
+          {{ _now_step in ['Revisions', 'RevisionAttachments', 'RevisionAttachmentTombstones']
+             and _now_doc != '' and _now_doc < d1_limited_id | lower }}
+        during_position: "{{ _now_line.stdout[:24] }} step {{ _now_step or '(none -- ' ~ _now_line.stdout[-60:] ~ ')' }}, document '{{ _now_doc }}'"
+
+    - name: Writes and enforce during the cleanup
+      ansible.builtin.debug:
+        msg: >-
+          {{ d1_limited_id }}: {{ sample_before[d1_limited_id].count }} revisions (keep {{ d1_limited_keep }}) ->
+          {{ _lim_written.json.TotalResults }} after {{ d1_writes_during }} writes ->
+          {{ _lim_enforced.json.TotalResults }} after enforce ({{ _enf_during_state.json.Status }});
+          the cleanup was at: {{ during_position }}
+          {{- '' if during_checked_in_time else ' -- it had ALREADY REACHED the limited doc, so these checks prove nothing (shapes too small?)' }}
+
+    - name: Assert the cleanup had not reached the limited doc yet
+      ansible.builtin.assert:
+        that: during_checked_in_time | bool
+        fail_msg: >-
+          By the end of the writes + enforce the cleanup was at '{{ during_position }}' -- past
+          {{ d1_limited_id }}, so the "not pruned during the cleanup" checks are meaningless.  The big
+          docs are too small for this machine: raise their revs.
+
+    - name: Assert the writes did not prune it and enforce left it as it was
+      ansible.builtin.assert:
+        that:
+          - _lim_written.json.TotalResults | int == (sample_before[d1_limited_id].count | int) + (d1_writes_during | int)
+          - _enf_during_state.json.Status == 'Completed'
+          - _lim_enforced.json.TotalResults | int == _lim_written.json.TotalResults | int
+        fail_msg: >-
+          {{ d1_limited_id }} (keep {{ d1_limited_keep }}): {{ sample_before[d1_limited_id].count }} ->
+          {{ _lim_written.json.TotalResults }} after {{ d1_writes_during }} writes (expected
+          {{ (sample_before[d1_limited_id].count | int) + (d1_writes_during | int) }}: no pruning before the
+          cleanup passed it) -> {{ _lim_enforced.json.TotalResults }} after enforce (expected unchanged),
+          enforce {{ _enf_during_state.json.Status }} {{ _enf_during_state.json.Result | default('') }}
+
+    # ---- wait for the cleanup ----------------------------------------------------------------------
+
+    - name: Wait for "{{ cleanup_done_pattern }}" (up to {{ ((d1_cleanup_timeout_secs | int) / 3600) | round(1) }} h; live -- docker exec {{ d1_node }} sh -c 'tail -F {{ log_dir }}/* | grep --line-buffered "{{ cleanup_any_pattern }}"')
+      ansible.builtin.shell: |
+        end=$(( $(date +%s) + {{ d1_cleanup_timeout_secs | int }} ))
+        while [ $(date +%s) -lt $end ]; do
+          {{ d1_lines_cmd }} | grep -qF '{{ cleanup_done_pattern }}' && exit 0
+          sleep 15
+        done
+        echo "no '{{ cleanup_done_pattern }}' within {{ d1_cleanup_timeout_secs }}s; last line: $({{ d1_lines_cmd }} | tail -1 | cut -c1-300)" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: _wait
+      changed_when: false
+      failed_when: false
+
+    - name: After window starts
+      ansible.builtin.set_fact:
+        t_done: "{{ lookup('pipe', 'date +%s.%N') }}"
+
+    - name: After window -- {{ d1_after_secs }}s once the cleanup is done (the write probe's baseline)
+      ansible.builtin.pause:
+        seconds: "{{ d1_after_secs | int }}"
+      when: _wait.rc == 0
+
+    - name: Measurements end
+      ansible.builtin.set_fact:
+        t_end: "{{ lookup('pipe', 'date +%s.%N') }}"
+
+    - name: Stop the metrics sampler
+      ansible.builtin.file:
+        path: "{{ _m }}.stop"
+        state: touch
+        mode: "0644"
+
+    - name: Wait for it to exit
+      ansible.builtin.async_status:
+        jid: "{{ _sampler.ansible_job_id }}"
+      register: _bg
+      until: _bg.finished
+      retries: 30
+      delay: 2
+
+    - name: Stop the write probe, summarize per window
+      ansible.builtin.include_tasks: ../rkc-common/probe_stop.yml
+      vars:
+        probe_csv: "{{ _p }}.csv"
+        probe_windows_spec: "{{ ['cleanup:' ~ t_load ~ ':' ~ t_done, 'after:' ~ t_done ~ ':' ~ t_end] }}"
+
+    - name: Stop -- the key cleanup did not finish in time
+      ansible.builtin.fail:
+        msg: "{{ _wait.stderr }}.  Raw metrics so far: {{ _m }}.csv"
+      when: _wait.rc != 0
+
+    - name: Save the cleanup lines
+      ansible.builtin.shell: "{{ d1_lines_cmd }} > {{ d1_out_dir }}/cleanup-lines.log"
+      changed_when: false
+
+    - name: Check the cleanup lines -- it only moved forward, one LastRawEtag, no error line
+      ansible.builtin.shell: >-
+        {{ ansible_playbook_python }} {{ repo_root }}/scripts/cleanup_resume.py < {{ d1_out_dir }}/cleanup-lines.log
+      register: _lines_check
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the cleanup lines are clean
+      ansible.builtin.assert:
+        that: (_lines_check.stdout | from_json).ok
+        fail_msg: "{{ (_lines_check.stdout | from_json).problems }} -- lines in {{ d1_out_dir }}/cleanup-lines.log"
+
+    - name: The cleanup's timeline (per doc, per step)
+      ansible.builtin.shell: >-
+        {{ ansible_playbook_python }} {{ repo_root }}/scripts/cleanup_resume.py --timeline < {{ d1_out_dir }}/cleanup-lines.log
+      register: _timeline
+      changed_when: false
+
+    - name: Summarize the metrics per window
+      ansible.builtin.command:
+        argv: >-
+          {{ [ansible_playbook_python, repo_root ~ '/scripts/container_metrics.py', 'summarize', '--csv', _m ~ '.csv',
+              '--window', 'idle:' ~ ((t_idle | float) + (d1_sample_interval_secs | float)) ~ ':' ~ t_load,
+              '--window', 'cleanup:' ~ t_load ~ ':' ~ t_done, '--window', 'after:' ~ t_done ~ ':' ~ t_end] }}
+      register: _sum
+      changed_when: false
+
+    - name: Stop the size sampler, summarize per window
+      ansible.builtin.include_tasks: ../rkc-common/size_sample_stop.yml
+      vars:
+        size_csv: "{{ d1_out_dir }}/sizes.csv"
+        size_windows_spec:
+          - "idle:{{ t_idle }}:{{ t_load }}"
+          - "cleanup:{{ t_load }}:{{ t_done }}"
+          - "after:{{ t_done }}:{{ t_end }}"
+
+    - name: Build the report
+      ansible.builtin.set_fact:
+        d1_report:
+          from: "{{ v_before.json.FullVersion }}"
+          to: "{{ v_after.json.FullVersion }}"
+          profile: "{{ d1_profile }}"
+          shapes: "{{ d1_shapes }}"
+          total_revisions: "{{ d1_total_revisions }}"
+          cleanup: "{{ _timeline.stdout | from_json }}"
+          cleanup_secs: >-
+            {{ (((_timeline.stdout | from_json).done[:19] | to_datetime)
+                - ((_timeline.stdout | from_json).first_progress[:19] | to_datetime)).total_seconds() | int }}
+          during:
+            limited_before: "{{ sample_before[d1_limited_id].count }}"
+            limited_after_writes: "{{ _lim_written.json.TotalResults }}"
+            limited_after_enforce: "{{ _lim_enforced.json.TotalResults }}"
+            cleanup_was_at: "{{ during_position }}"
+          container: "{{ _sum.stdout | from_json }}"
+          probe_writes: "{{ probe_windows }}"
+          sizes: { snapshots: "{{ size_snapshots }}", windows: "{{ size_windows }}" }
+          notes:
+            - "cpu_pct: 100 = one full core.  mem_mb: cgroup memory.current, includes page cache (Voron maps its files)."
+            - "probe: one PUT every {{ d1_probe_interval_secs }}s to {{ d1_db }} (collection Probe), new TLS connection each; compare cleanup with after."
+            - "sizes: bytes; voron = Raven.voron (nominal / allocated), journal = Journals folder, total = db folder allocated."
+            - "The server loads the db at startup, so the idle window holds its schema upgrade and the cleanup's first seconds; cleanup = from the end of the idle window until 'is done'; cleanup_secs = first progress line -> 'is done' (server log)."
+
+    - name: Save the report
+      ansible.builtin.copy:
+        content: "{{ d1_report | to_nice_json }}"
+        dest: "{{ d1_out_dir }}/rkc7-report-{{ v_after.json.FullVersion }}.json"
+        mode: "0644"
+
+    - name: Cleanup timeline and measurements (reported, not judged)
+      ansible.builtin.debug:
+        msg: >-
+          {%- set t = d1_report.cleanup -%}
+          {%- set out = ['key cleanup ' ~ d1_report.cleanup_secs
+                ~ ' s (' ~ t.first_progress ~ ' -> ' ~ t.done ~ '), ' ~ t.progress_lines ~ ' progress lines'] -%}
+          {%- for doc, d in t.documents.items() -%}
+          {%- set _ = out.append('  ' ~ doc ~ ': ' ~ d.first[11:19] ~ ' -> ' ~ d.last[11:19] ~ ' (' ~ d.lines ~ ' batches)') -%}
+          {%- endfor -%}
+          {%- for step, s in t.steps.items() -%}
+          {%- set _ = out.append('  step ' ~ step ~ ': ' ~ s.first[11:19] ~ ' -> ' ~ s.last[11:19] ~ ' (' ~ s.lines ~ ' batches)') -%}
+          {%- endfor -%}
+          {%- for win in ['idle', 'cleanup', 'after'] -%}
+          {%- set m = d1_report.container[win] -%}
+          {%- set p = d1_report.probe_writes[win] | default({}) -%}
+          {%- set _ = out.append(win ~ ': CPU avg ' ~ m.cpu_pct_avg | default('?') ~ '% peak ' ~ m.cpu_pct_peak | default('?')
+                ~ '%, mem avg ' ~ m.mem_mb_avg | default('?') ~ ' MB peak ' ~ m.mem_mb_peak | default('?')
+                ~ ' MB, read ' ~ m.read_mb_s_avg | default('?') ~ ' MB/s (peak ' ~ m.read_mb_s_peak | default('?')
+                ~ '), write ' ~ m.write_mb_s_avg | default('?') ~ ' MB/s (peak ' ~ m.write_mb_s_peak | default('?') ~ ')'
+                ~ ((' | probe ' ~ p.writes ~ ' writes, ' ~ p.errors ~ ' errors, p50 ' ~ p.p50_ms ~ ' / p99 ' ~ p.p99_ms
+                    ~ ' / max ' ~ p.max_ms ~ ' ms') if p else '')) -%}
+          {%- endfor -%}
+          {%- set _ = out.append('report: ' ~ d1_out_dir ~ '/rkc7-report-' ~ v_after.json.FullVersion ~ '.json') -%}
+          {{ out }}
+
+
+# ----- step 4: verify after the key cleanup ---------------------------------------------------------
+
+- name: Dataset 1 -- step 4 -- verify after the key cleanup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Sample the big docs again and read the sampled attachments back (after)
+      ravendb_revisions_sample:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ d1_node }}"
+        db_name: "{{ d1_db }}"
+        ids: "{{ d1_big_ids }}"
+        pages: "{{ d1_sample_pages | int }}"
+        verify_attachment_content: true
+      register: _sample_after
+
+    - name: Assert every big doc unchanged (count + every sampled page), attachments read back
+      ansible.builtin.assert:
+        that:
+          - _diff | length == 0
+          - _sample_after.attachments_checked | int == att_before | int
+        fail_msg: >-
+          changed: {{ _diff }}; attachments read back {{ _sample_after.attachments_checked }} (before {{ att_before }})
+      vars:
+        _diff: >-
+          {%- set out = [] -%}
+          {%- for k in d1_big_ids if _sample_after.samples[k] != sample_before[k] -%}
+          {%- set a, b = _sample_after.samples[k], sample_before[k] -%}
+          {%- set _ = out.append(k ~ ': count ' ~ b.count ~ ' -> ' ~ a.count ~ ', pages differing '
+                ~ (b.pages | dict2items | rejectattr('value', 'in', a.pages.values() | list) | map(attribute='key') | list)) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Read /stats (after the key cleanup)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 300
+      register: stats_after
+
+    - name: Read the collections (the probe's docs are counted apart)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/collections/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _collections
+
+    # Revisions: + the writes during the cleanup (Probe has none).  Tombstones: nothing was pruned.
+    - name: Assert totals after the key cleanup
+      ansible.builtin.assert:
+        that:
+          - stats_after.json.CountOfDocuments | int - (_collections.json.Collections.Probe | default(0)) | int == stats_before.json.CountOfDocuments | int
+          - stats_after.json.CountOfRevisionDocuments | int == (stats_before.json.CountOfRevisionDocuments | int) + (d1_writes_during | int)
+          - stats_after.json.CountOfUniqueAttachments | int == stats_before.json.CountOfUniqueAttachments | int
+          - stats_after.json.CountOfTombstones | int == stats_before.json.CountOfTombstones | int
+        fail_msg: >-
+          docs (without Probe) {{ stats_before.json.CountOfDocuments }} -> {{ stats_after.json.CountOfDocuments | int - (_collections.json.Collections.Probe | default(0)) | int }},
+          revisions {{ stats_before.json.CountOfRevisionDocuments }} -> {{ stats_after.json.CountOfRevisionDocuments }}
+          (expected +{{ d1_writes_during }}), unique attachments {{ stats_before.json.CountOfUniqueAttachments }} ->
+          {{ stats_after.json.CountOfUniqueAttachments }}, tombstones {{ stats_before.json.CountOfTombstones }} ->
+          {{ stats_after.json.CountOfTombstones }}
+
+    - name: No orphan revisions (server-side scan, up to {{ d1_orphan_check_budget_secs }}s)
+      ravendb_diagnostic:
+        kind: orphan_revisions
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        db_name: "{{ d1_db }}"
+        nodes: ["{{ d1_node }}"]
+        assert_mode: true
+        budget_secs: "{{ d1_orphan_check_budget_secs | int }}"
+
+
+# ----- step 5: enforce after the cleanup -- the limited doc comes down to its keep ------------------
+
+- name: Dataset 1 -- step 5 -- enforce the revisions configuration after the cleanup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Enforce the revisions configuration
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/admin/revisions/config/enforce"
+        method: POST
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        body_format: json
+        body: { IncludeForceCreated: false }
+      register: _enf
+
+    - name: Wait for the enforce operation (up to {{ ((d1_enforce_timeout_secs | int) / 60) | round | int }} min)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/operations/state?id={{ _enf.json.OperationId }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+      register: _enf_state
+      until: _enf_state.json.Status | default('') in ['Completed', 'Faulted', 'Canceled']
+      retries: "{{ (d1_enforce_timeout_secs | int) // 5 }}"
+      delay: 5
+
+    - name: Count every doc's revisions
+      ravendb_revisions_sample:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ d1_node }}"
+        db_name: "{{ d1_db }}"
+        ids: "{{ d1_all_ids }}"
+        pages: 1
+      register: _counts
+
+    - name: Read /stats (after enforce)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 300
+      register: stats_enforced
+
+    - name: Assert the limited doc is at exactly its keep, the big docs untouched, one tombstone per revision deleted
+      ansible.builtin.assert:
+        that:
+          - _enf_state.json.Status == 'Completed'
+          - _counts.samples[d1_limited_id].count == d1_limited_keep | int
+          - _big_changed | length == 0
+          - stats_enforced.json.CountOfTombstones | int >= (stats_after.json.CountOfTombstones | int) + _deleted | int
+        fail_msg: >-
+          enforce {{ _enf_state.json.Status }} {{ _enf_state.json.Result | default('') }};
+          {{ d1_limited_id }}: {{ _counts.samples[d1_limited_id].count }} revisions (expected {{ d1_limited_keep }});
+          big docs changed: {{ _big_changed }}; tombstones {{ stats_after.json.CountOfTombstones }} ->
+          {{ stats_enforced.json.CountOfTombstones }} (expected at least +{{ _deleted }})
+      vars:
+        _deleted: "{{ (_lim_written.json.TotalResults | int) - (d1_limited_keep | int) }}"
+        _big_changed: >-
+          {%- set out = [] -%}
+          {%- for k in d1_big_ids if _counts.samples[k].count != sample_before[k].count -%}
+          {%- set _ = out.append(k ~ ': ' ~ sample_before[k].count ~ ' -> ' ~ _counts.samples[k].count) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Enforce took
+      ansible.builtin.debug:
+        msg: >-
+          enforce after the cleanup: {{ d1_limited_id }} {{ _lim_written.json.TotalResults }} -> {{ d1_limited_keep }}
+          revisions; tombstones {{ stats_after.json.CountOfTombstones }} -> {{ stats_enforced.json.CountOfTombstones }}
+
+    - name: Data file + journal sizes after enforce
+      ansible.builtin.include_tasks: ../rkc-common/size_snapshot.yml
+      vars: { size_node: "{{ d1_node }}", size_dbs: ["{{ d1_db }}"], size_label: "after enforce" }
+
+    - name: Count key-cleanup log lines before the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ d1_node }}"
+
+    - name: Keep the count from before the restart
+      ansible.builtin.set_fact:
+        lines_before_restart: "{{ cleanup_line_count }}"
+
+
+# ----- step 6: restart, no cleanup runs again --------------------------------------------------------
+
+- ansible.builtin.import_playbook: ../../../toolbox/service/restart_ravendb.yml
+  vars:
+    target: "{{ d1_node | default('1a') }}"
+
+- name: Dataset 1 -- step 6 -- the key cleanup must not run again after restart
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../rkc-common/vars.yml, vars.yml]
+  tasks:
+    - name: Load {{ d1_db }} again
+      ansible.builtin.uri:
+        url: "{{ base_url }}/databases/{{ d1_db }}/stats"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_path: "{{ cert_ca_crt }}"
+        timeout: 300
+      register: _reload
+      retries: 60
+      delay: 5
+      until: _reload is succeeded
+
+    - name: Watch the log for {{ rerun_quiet_secs }}s
+      ansible.builtin.pause:
+        seconds: "{{ rerun_quiet_secs | int }}"
+
+    - name: Count key-cleanup log lines after the restart
+      ansible.builtin.include_tasks: ../rkc-common/count_cleanup_lines.yml
+      vars:
+        cleanup_node: "{{ d1_node }}"
+
+    - name: Assert no new key-cleanup lines
+      ansible.builtin.assert:
+        that: cleanup_line_count | int == lines_before_restart | int
+        fail_msg: "key cleanup ran again after restart: {{ lines_before_restart }} -> {{ cleanup_line_count }} cleanup log lines"
+
+    - name: Sample the big docs again (after restart)
+      ravendb_revisions_sample:
+        ravendb_domain: "{{ ravendb_domain }}"
+        client_cert: "{{ cert_dir }}/client.pem"
+        ca_cert: "{{ cert_ca_crt }}"
+        target: "{{ d1_node }}"
+        db_name: "{{ d1_db }}"
+        ids: "{{ d1_big_ids }}"
+        pages: "{{ d1_sample_pages | int }}"
+      register: _sample_restart
+
+    - name: Assert the big docs still unchanged
+      ansible.builtin.assert:
+        that: d1_big_ids | map('extract', _sample_restart.samples) | list == d1_big_ids | map('extract', sample_before) | list
+        fail_msg: "big docs' revision samples changed after restart"
+
+    - name: Data file + journal sizes after the restart
+      ansible.builtin.include_tasks: ../rkc-common/size_snapshot.yml
+      vars: { size_node: "{{ d1_node }}", size_dbs: ["{{ d1_db }}"], size_label: "after restart" }
+
+    - name: Sizes
+      ansible.builtin.include_tasks: ../rkc-common/size_report.yml
+
+    - name: Save the report again, with the sizes after enforce and restart
+      ansible.builtin.copy:
+        content: "{{ d1_report | combine({'sizes': {'snapshots': size_snapshots, 'windows': size_windows}}) | to_nice_json }}"
+        dest: "{{ d1_out_dir }}/rkc7-report-{{ v_after.json.FullVersion }}.json"
+        mode: "0644"
+
+    - name: "RESULT: dataset 1 (few docs x millions of revisions) -- PASSED"
+      ansible.builtin.debug:
+        msg:
+          - "PASSED: revisions key cleanup on {{ d1_all_ids | length }} docs with {{ d1_total_revisions }} revisions (profile {{ d1_profile }}), upgraded in place {{ v_before.json.FullVersion }} -> {{ v_after.json.FullVersion }}"
+          - "Key cleanup: {{ d1_report.cleanup_secs }} s (first progress line -> is done); timeline + measurements in {{ d1_out_dir }}/rkc7-report-{{ v_after.json.FullVersion }}.json"
+          - "OK  the cleanup only moved forward, logged no error line, and did not run again after a restart"
+          - "OK  big docs unchanged: exact counts, {{ d1_sample_pages }} sampled pages each, {{ att_before }} attachments read back"
+          - "OK  while the cleanup had not reached {{ d1_limited_id }}: {{ d1_writes_during }} writes did not prune it and enforce left it ({{ _lim_enforced.json.TotalResults }} revisions, keep {{ d1_limited_keep }})"
+          - "OK  enforce after the cleanup brought it down to exactly {{ d1_limited_keep }}; totals as expected, no orphan revisions"

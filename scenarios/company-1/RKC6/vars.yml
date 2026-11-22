@@ -1,0 +1,46 @@
+# scenarios/company-1/RKC6/vars.yml -- inputs for rkc6.yml (restart in the middle of the key
+# cleanup).  Every key can be overridden with -e on the command line.
+
+rr_node: "1a"
+rr_db: db_resume
+
+# Revisions policy written on 6.2 before seeding (same roles as ../RKC2/vars.yml):
+#   Default keep rr_default_keep (above every shape's revisions: nothing pruned),
+#   Pruned  keep rr_pruned_keep  (every write past keep leaves a revision tombstone).
+rr_default_keep: 1000000
+rr_pruned_keep: 3
+# Tombstone cleaner's timer off (see ../RKC2/vars.yml), so the tombstones survive until step 4.
+rr_tombstone_cleanup_interval_min: 100000
+
+# A SMALL dataset, but big enough that each phase of the cleanup lasts long enough to be hit.
+# (RKC1's 5 x 5 is done in a single 250 ms batch -- nothing to interrupt.)  The cleanup logs one
+# progress line per batch: ~250 ms of work + 250 ms pause, so ~2 lines/s.
+#   att     20 docs x 200 revisions, 10 docs get a 4 KB attachment every 20 revisions
+#           (covers the RevisionAttachments step)
+#   plain  400 docs x 500 revisions = 200k revisions   -> the documents phase, tens of seconds
+#   pruned  40 docs x 5000 writes, keep 3 = ~200k revision tombstones -> the tombstones phase
+#           (5 docs get an attachment every 500 writes)
+# Documents are walked in byte order of the id: rr/att/*, rr/plain/*, rr/pruned/*.
+# Seeding: about a minute.  If a restart point reports MISSED, raise plain docs / pruned docs.
+rr_shapes:
+  - { name: att,    prefix: rr/att,    collection: Att,    docs: 20,  revs: 200,  att_docs: 10, att_every: 20,  att_size: 4096 }
+  - { name: plain,  prefix: rr/plain,  collection: Plain,  docs: 400, revs: 500,  pad_bytes: 120 }
+  - { name: pruned, prefix: rr/pruned, collection: Pruned, docs: 40,  revs: 5000, att_docs: 5,  att_every: 500, att_size: 2048 }
+
+# Where to restart, in order.  phase: documents | tombstones.  after_lines: progress lines of
+# that phase since the server last came up.  how: restart (systemctl restart = SIGTERM, clean
+# shutdown) | kill (SIGKILL, no shutdown -- only committed batches survive).
+rr_restarts:
+  - { name: mid-documents,  phase: documents,  after_lines: 10, how: restart }
+  - { name: mid-tombstones, phase: tombstones, after_lines: 2,  how: kill }
+
+# The cleaner logs "An error occurred in the revisions key cleanup ... it continues on the next
+# database load" if a batch is cut off by the shutdown.  true = report such lines logged WHILE the
+# server shut down, without failing; any other error line always fails.
+rr_allow_shutdown_errors: true
+
+# Budget for all the restart points (waits + restarts + reloads).
+rr_restart_timeout_secs: 1200
+
+rr_loader_threads: 8
+rr_loader_batch: 1000
