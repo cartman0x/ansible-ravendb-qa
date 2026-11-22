@@ -1,0 +1,11 @@
+# Python dependencies for running tests/ (unit + integration smoke).
+#   python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
+#
+# The Ansible modules under library/ are tested through a shim (see tests/conftest.py),
+# so ansible itself is not needed here.
+#
+# Pinned to the versions the suite was last verified with.  ravendb-embedded and ravendb
+# are released together, so keep their versions identical.
+pytest==9.2.0
+ravendb-embedded==7.2.7
+ravendb==7.2.7
