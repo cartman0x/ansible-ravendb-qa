@@ -65,6 +65,11 @@ def _start_node(http_port, tcp_port):
     logs_dir = tempfile.mkdtemp(prefix="raven-test-logs-")
     s = EmbeddedServer()
     opts = ServerOptions()
+    # Test a specific RavenDB build (e.g. a nightly) instead of the server bundled with
+    # ravendb-embedded.  Point at an unpacked server dir (contains Raven.Server.dll) or a zip.
+    server_location = os.environ.get("RAVEN_TEST_SERVER_DIR")
+    if server_location:
+        opts.with_external_server(server_location)
     opts.data_directory = data_dir
     opts.logs_path = logs_dir
     opts.server_url = "http://127.0.0.1:%d" % http_port
