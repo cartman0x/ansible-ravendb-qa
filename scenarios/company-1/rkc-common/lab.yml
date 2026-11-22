@@ -1,0 +1,4 @@
+# Passed to every ansible-playbook call of the RKC run.sh scripts (-e @...).
+# The lab certificates cover *.hubsink.test; the inventory's default domain (ravendb.test) needs
+# new ones.  Delete this file and its run.sh references once those certificates exist.
+ravendb_domain: hubsink.test

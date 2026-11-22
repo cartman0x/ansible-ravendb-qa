@@ -20,7 +20,7 @@ V62="${POS[0]:-}"; V_NEW="${POS[1]:-}"
 cd "$(dirname "$0")/../../.."
 [[ "$V_NEW" = /* ]] || V_NEW="$PWD/$V_NEW"
 [ -f "$V_NEW" ] || { echo "ERROR: $V_NEW not found"; exit 3; }
-NEW_ARGS=( -e custom_build="$V_NEW" --skip-tags download )
+NEW_ARGS=( -e @scenarios/company-1/rkc-common/lab.yml -e custom_build="$V_NEW" --skip-tags download )
 
 # sudo: -k so a password cached in this terminal doesn't count as passwordless.
 if sudo -k -n true 2>/dev/null; then
@@ -33,7 +33,7 @@ else
   printf '%s\n' "$ANSIBLE_BECOME_PASS" | sudo -S -k -p '' -v 2>/dev/null || { echo "ERROR: sudo rejected the BECOME password"; exit 4; }
 fi
 
-C=( -e clusters_count=1 -e nodes_per_cluster=1 )
+C=( -e @scenarios/company-1/rkc-common/lab.yml -e clusters_count=1 -e nodes_per_cluster=1 )
 MEM=(); [ -n "${CONTAINER_MEMORY:-}" ] && MEM=( -e container_memory="$CONTAINER_MEMORY" )   # e.g. CONTAINER_MEMORY=10g run.sh ...
 
 step() { printf '\n\033[1;36m[%s] %s\033[0m\n' "$(date +%H:%M:%S)" "$*"; }

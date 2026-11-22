@@ -26,7 +26,7 @@ V62="${POS[0]:-}"; V_NEW="${POS[1]:-}"
 cd "$(dirname "$0")/../../.."
 [[ "$V_NEW" = /* ]] || V_NEW="$PWD/$V_NEW"
 [ -f "$V_NEW" ] || { echo "ERROR: $V_NEW not found"; exit 3; }
-NEW_ARGS=( -e custom_build="$V_NEW" --skip-tags download )
+NEW_ARGS=( -e @scenarios/company-1/rkc-common/lab.yml -e custom_build="$V_NEW" --skip-tags download )
 
 # sudo -k: ignore a cached password, so -n passes only when sudo truly needs none.
 if sudo -k -n true 2>/dev/null; then
@@ -39,7 +39,7 @@ else
   printf '%s\n' "$ANSIBLE_BECOME_PASS" | sudo -S -k -p '' -v 2>/dev/null || { echo "ERROR: sudo rejected the BECOME password"; exit 4; }
 fi
 
-C=( -e clusters_count=1 -e nodes_per_cluster=1 )
+C=( -e @scenarios/company-1/rkc-common/lab.yml -e clusters_count=1 -e nodes_per_cluster=1 )
 # The point of RKC10: the container gets LESS memory than the data.  Its own variable, so the
 # CONTAINER_MEMORY that remote.sh / run_all set for the other tests (90% of RAM) does not apply.
 CONTAINER_MEMORY="${RKC10_MEMORY:-8g}"

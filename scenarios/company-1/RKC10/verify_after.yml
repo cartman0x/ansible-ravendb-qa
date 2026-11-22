@@ -19,7 +19,7 @@
 # the 6.2 ones -- those were in memory only.  Counts + attachment content are checked instead.
 #
 # RUN (repo root, same lab, same vars as the RKC10 run):
-#   ansible-playbook scenarios/company-1/RKC10/verify_after.yml -e @scenarios/company-1/RKC10/vars.yml
+#   ansible-playbook scenarios/company-1/RKC10/verify_after.yml -e @scenarios/company-1/RKC10/vars.yml -e @scenarios/company-1/rkc-common/lab.yml
 # Optional: -e rkc10_att_read_back=N  (attachments the 6.2 run read back per db: "(N read back)" in
 #   its Baseline summary; 7 at rkc5_scale 0.1)
 # Writes: <rkc5_out_dir>/verify-after.json
