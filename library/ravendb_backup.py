@@ -74,6 +74,31 @@ def get_backup_status(p, target, db, task_id):
     return data.get("Status") or None
 
 
+def s3_settings(p, remote_folder=None):
+    """RavenDB S3Settings from the module's s3_* params, or None when no bucket is set.
+    Secrets go only into the request body -- never into messages or logs."""
+    if not p.get("s3_bucket"):
+        return None
+    if not (p.get("s3_access_key") and p.get("s3_secret_key") and p.get("s3_region")):
+        raise ValueError("S3 needs s3_access_key, s3_secret_key and s3_region "
+                         "(AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION)")
+    return {
+        "Disabled": False,
+        "AwsAccessKey": p["s3_access_key"],
+        "AwsSecretKey": p["s3_secret_key"],
+        "AwsSessionToken": p.get("s3_session_token") or None,
+        "AwsRegionName": p["s3_region"],
+        "BucketName": p["s3_bucket"],
+        "RemoteFolderName": remote_folder if remote_folder is not None else (p.get("s3_folder") or ""),
+        "CustomServerUrl": None,
+        "ForcePathStyle": False,
+    }
+
+
+def s3_url(p, folder=None):
+    return "s3://%s/%s" % (p["s3_bucket"], folder if folder is not None else (p.get("s3_folder") or ""))
+
+
 def k_backup(p):
     """Create a periodic-backup task, trigger it, wait for completion, and clean up the task."""
     target = p["target"]
@@ -86,6 +111,7 @@ def k_backup(p):
     progress_log = p["progress_log"]
 
     task_name = "manual-%s-%d" % (timestamp, random.randint(0, 9999))
+    s3 = s3_settings(p)
 
     # 1. Create a periodic-backup task scheduled far in the future.
     task_body = {
@@ -94,11 +120,12 @@ def k_backup(p):
         "Disabled": False,
         "FullBackupFrequency": "0 0 1 1 *",
         "IncrementalBackupFrequency": None,
-        "LocalSettings": {
+        # S3 mode: upload only (RavenDB stages the file in its temp folder, then uploads).
+        "LocalSettings": None if s3 else {
             "FolderPath": backup_path,
             "Disabled": False,
         },
-        "S3Settings": None,
+        "S3Settings": s3,
         "AzureSettings": None,
         "GoogleCloudSettings": None,
         "FtpSettings": None,
@@ -134,7 +161,7 @@ def k_backup(p):
             return False, None
 
         local = s.get("LocalBackup") or {}
-        exception = local.get("Exception")
+        exception = local.get("Exception") or (s.get("UploadToS3") or {}).get("Exception")
         if exception:
             log_line(progress_log, "FAILED  exception=%s" % exception)
             return True, s
@@ -149,22 +176,33 @@ def k_backup(p):
     done, last_status, elapsed = poll_until(predicate, timeout=timeout, interval=interval)
     log_line(progress_log, "FINISHED  done=%s  elapsed=%.1fs" % (done, elapsed))
 
-    # 5. Delete the periodic-backup task (best-effort cleanup).
-    cleanup_path = ("/databases/%s/admin/tasks?id=%d&type=PeriodicBackup&taskName=%s" %
+    # 5. Delete the periodic-backup task.  NOT best-effort: a leftover backup task pins every
+    #    tombstone for its next incremental backup (MinAllDocsEtag 0), so the tombstone cleaner
+    #    deletes nothing.  The ongoing-task type is "Backup" -- "PeriodicBackup" is HTTP 500,
+    #    which this used to ignore (found 2026-11-11: a dataset build kept 499,500 tombstones).
+    cleanup_path = ("/databases/%s/admin/tasks?id=%d&type=Backup&taskName=%s" %
                     (db, task_id, quote(task_name)))
-    request("DELETE", target, p["ravendb_domain"], cleanup_path,
-            p["client_cert"], p["ca_cert"])
+    del_status, del_body = request("DELETE", target, p["ravendb_domain"], cleanup_path,
+                                   p["client_cert"], p["ca_cert"])
+    if del_status not in (200, 201, 204):
+        raise RuntimeError(
+            "backup finished but its temporary task %s (TaskId=%d) could not be deleted: HTTP %d %s"
+            " -- it holds tombstones; delete it via Studio > Ongoing Tasks"
+            % (task_name, task_id, del_status, (del_body or b"")[:200]))
 
     if not done:
         raise RuntimeError("backup did not complete within %.1fs; last status: %s" %
                            (elapsed, json.dumps(last_status)))
 
     local = (last_status or {}).get("LocalBackup") or {}
-    exception = local.get("Exception")
+    upload = (last_status or {}).get("UploadToS3") or {}
+    exception = local.get("Exception") or upload.get("Exception")
     if exception:
         raise RuntimeError("backup failed: %s" % exception)
+    if s3 and upload.get("Skipped"):
+        raise RuntimeError("backup finished but the S3 upload was skipped: %s" % json.dumps(upload))
 
-    folder = local.get("BackupDirectory") or backup_path
+    folder = s3_url(p) if s3 else (local.get("BackupDirectory") or backup_path)
     duration_ms = local.get("FullBackupDurationInMs")
     return ("BACKED UP %s (%s) on responsible node %s -> %s "
             "(TaskId=%d, server reports %dms, total wall-clock %.1fs)" %
@@ -181,16 +219,28 @@ def k_restore(p):
     interval = p["poll_interval"]
 
     if not backup_path or not new_db:
-        raise ValueError("kind=restore requires `backup_path` and `new_db_name`")
+        raise ValueError("kind=restore requires `backup_path` and `new_db_name` "
+                         "(with s3_bucket set, backup_path is the restore point's S3 folder)")
 
     # 1. Trigger the restore.
-    body = {
-        "Type": "Local",
-        "BackupLocation": backup_path,
-        "DatabaseName": new_db,
-        "DisableOngoingTasks": True,
-        "EncryptionKey": None,
-    }
+    s3 = s3_settings(p, remote_folder=backup_path)
+    if s3:
+        body = {
+            "Type": "S3",
+            "Settings": s3,
+            "DatabaseName": new_db,
+            "DisableOngoingTasks": True,
+            "EncryptionKey": None,
+        }
+        backup_path = s3_url(p, backup_path)
+    else:
+        body = {
+            "Type": "Local",
+            "BackupLocation": backup_path,
+            "DatabaseName": new_db,
+            "DisableOngoingTasks": True,
+            "EncryptionKey": None,
+        }
     trigger_path = "/admin/restore/database"
     status, resp = request("POST", target, p["ravendb_domain"], trigger_path,
                            p["client_cert"], p["ca_cert"], body=body)
@@ -210,9 +260,43 @@ def k_restore(p):
             (backup_path, new_db, target, op_id, elapsed))
 
 
+def k_restore_points(p):
+    """Lists the backups under s3_folder (S3) or backup_path (local), newest first.
+    Returns (message, {"restore_points": [...]})."""
+    s3 = s3_settings(p)
+    if s3:
+        path, body, where = "/admin/restore/points?type=S3", s3, s3_url(p)
+    else:
+        if not p.get("backup_path"):
+            raise ValueError("kind=restore_points needs s3_bucket (+ s3_folder) or backup_path")
+        path = "/admin/restore/points?type=Local"
+        body = {"FolderPath": p["backup_path"]}
+        where = p["backup_path"]
+    status, resp = request("POST", p["target"], p["ravendb_domain"], path,
+                           p["client_cert"], p["ca_cert"], body=body, timeout=120)
+    # RavenDB 6.2 answers an empty (or missing) folder with HTTP 500 InvalidOperationException
+    # "Couldn't locate any backup files." instead of an empty list -- that means "none yet".
+    if status == 500 and b"Couldn't locate any backup files" in (resp or b""):
+        return ("0 restore point(s) in %s" % where, {"restore_points": []})
+    if status != 200:
+        raise RuntimeError("listing restore points in %s failed: HTTP %d %s"
+                           % (where, status, (resp or b"")[:300]))
+    points = [{
+        "location": rp.get("Location"),
+        "file_name": rp.get("FileName"),
+        "date_time": rp.get("DateTime"),
+        "is_snapshot": bool(rp.get("IsSnapshotRestore")),
+        "database_name": rp.get("DatabaseName"),
+        "node_tag": rp.get("NodeTag"),
+    } for rp in (json.loads(resp).get("List") or [])]
+    points.sort(key=lambda x: x["date_time"] or "", reverse=True)
+    return ("%d restore point(s) in %s" % (len(points), where), {"restore_points": points})
+
+
 KINDS = {
     "backup":          k_backup,
     "restore":         k_restore,
+    "restore_points":  k_restore_points,
 }
 
 
@@ -229,6 +313,13 @@ def main():
         backup_path=dict(default=None),
         # restore
         new_db_name=dict(default=None),
+        # S3 (backup destination / restore source / restore_points).  Unset bucket = local.
+        s3_bucket=dict(default=None),
+        s3_region=dict(default=None),
+        s3_folder=dict(default=None),
+        s3_access_key=dict(default=None, no_log=True),
+        s3_secret_key=dict(default=None, no_log=True),
+        s3_session_token=dict(default=None, no_log=True),
         # timing (used by backup + restore)
         timeout=dict(type="int", default=300),
         poll_interval=dict(type="int", default=3),
@@ -238,11 +329,12 @@ def main():
 
     handler = KINDS[module.params["kind"]]
     try:
-        message = handler(module.params)
+        result = handler(module.params)
     except Exception as e:
         module.fail_json(msg=str(e))
 
-    module.exit_json(changed=True, msg=message)
+    message, extra = result if isinstance(result, tuple) else (result, {})
+    module.exit_json(changed=module.params["kind"] != "restore_points", msg=message, **extra)
 
 
 if __name__ == "__main__":
